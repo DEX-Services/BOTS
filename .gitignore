@@ -1,0 +1,3 @@
+.env
+kafka-ca.pem
+.DS_Store
