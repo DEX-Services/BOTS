@@ -7,10 +7,10 @@ import (
 	"strings"
 )
 
-// cors wraps a handler with credentialed CORS for the configured origins.
+// CORS wraps a handler with credentialed CORS for the configured origins.
 // The frontend calls the bots API with credentials: "include" (the dex_session
 // cookie), so ACAO must reflect the specific origin and ACA-Credentials=true.
-func cors(allowed map[string]bool, next http.Handler) http.Handler {
+func CORS(allowed map[string]bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" && (len(allowed) == 0 || allowed[origin]) {

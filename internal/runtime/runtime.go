@@ -88,6 +88,7 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 		startedAt: time.Now(),
 	}
+	m.mu.Lock()
 	m.workers[botID] = w
 	m.mu.Unlock()
 	go w.run()
@@ -140,7 +141,7 @@ type worker struct {
 	manager   *Manager
 	bot       *models.Bot
 	strategy  strategy.Strategy
-	wakeCh    <-chan struct{}
+	wakeCh    chan struct{}
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 	startedAt time.Time
@@ -214,8 +215,8 @@ func computeStats(s strategy.State, md marketdata.Snapshot, bot *models.Bot, sta
 	stats.ROI = roi.String()
 	stats.RuntimeSec = int64(now.Sub(startedAt).Seconds())
 	stats.MatchedTrades = s.MatchedTrades
-	stats.Trades24h = s.trades24h(now)
-	stats.MaxDrawdownPct = s.maxDrawdown().String()
+	stats.Trades24h = s.Trades24h(now)
+	stats.MaxDrawdownPct = s.MaxDrawdown().String()
 	stats.BaseHeld = held.String()
 	stats.AvgEntryPrice = avg.String()
 	return stats

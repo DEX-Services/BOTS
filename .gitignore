@@ -1,3 +1,6 @@
+# Bots service
 .env
+bots
+*.log
 kafka-ca.pem
 .DS_Store

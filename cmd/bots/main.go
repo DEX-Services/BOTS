@@ -56,7 +56,7 @@ func main() {
 
 	verifier := auth.NewVerifier(cfg.JWTSecret)
 	server := api.NewServer(st, manager, verifier)
-	handler := cors(cfg.AllowedOrigins, server.Routes())
+	handler := api.CORS(cfg.AllowedOrigins, server.Routes())
 
 	// Resume bots that were running before a restart.
 	manager.StartAll(ctx)

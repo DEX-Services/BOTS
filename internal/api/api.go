@@ -36,18 +36,22 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /bots", s.requireAuth(methodGuard(http.MethodGet, s.handleList)))
 	mux.HandleFunc("POST /bots", s.requireAuth(methodGuard(http.MethodPost, s.handleCreate)))
 
-	mux.HandleFunc("GET /bots/{id}", s.requireAuth(s.handleGet))
-	mux.HandleFunc("POST /bots/{id}/start", s.requireAuth(s.handleStart))
-	mux.HandleFunc("POST /bots/{id}/stop", s.requireAuth(s.handleStop))
-	mux.HandleFunc("DELETE /bots/{id}", s.requireAuth(s.handleDelete))
+	mux.HandleFunc("GET /bots/{id}", s.requireAuth(methodGuard(http.MethodGet, s.handleGet)))
+	mux.HandleFunc("POST /bots/{id}/start", s.requireAuth(methodGuard(http.MethodPost, s.handleStart)))
+	mux.HandleFunc("POST /bots/{id}/stop", s.requireAuth(methodGuard(http.MethodPost, s.handleStop)))
+	mux.HandleFunc("DELETE /bots/{id}", s.requireAuth(methodGuard(http.MethodDelete, s.handleDelete)))
 	mux.HandleFunc("POST /bots/{id}/copy", s.requireAuth(methodGuard(http.MethodPost, s.handleCopy)))
 
 	return mux
 }
 
-// requireAuth wraps a handler with JWT verification (no public fallback).
-func (s *Server) requireAuth(next http.Handler) http.Handler {
-	return auth.Middleware(s.auth, false, next)
+// requireAuth wraps a handler with JWT verification (no public fallback). It
+// accepts and returns http.HandlerFunc so it composes with methodGuard and
+// can be registered with mux.HandleFunc.
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth.Middleware(s.auth, false, next).ServeHTTP(w, r)
+	}
 }
 
 // ----- public -----

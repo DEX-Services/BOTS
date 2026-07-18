@@ -192,8 +192,8 @@ func (s *State) recordTrade(now time.Time) {
 	s.TradeTimes = append(kept, now.UnixMilli())
 }
 
-// trades24h returns how many fills occurred in the last 24h.
-func (s *State) trades24h(now time.Time) int {
+// Trades24h returns how many fills occurred in the last 24h.
+func (s *State) Trades24h(now time.Time) int {
 	cutoff := now.Add(-24 * time.Hour).UnixMilli()
 	n := 0
 	for _, t := range s.TradeTimes {
@@ -216,9 +216,9 @@ func (s *State) pushEquity(now time.Time, equity decimal.Decimal) {
 	s.Equity = append(kept, EquityPoint{Ms: now.UnixMilli(), Val: equity.String()})
 }
 
-// maxDrawdown computes the max peak-to-trough drawdown (%) over the equity
+// MaxDrawdown computes the max peak-to-trough drawdown (%) over the equity
 // samples, capped to the 7-day window maintained by pushEquity.
-func (s *State) maxDrawdown() decimal.Decimal {
+func (s *State) MaxDrawdown() decimal.Decimal {
 	if len(s.Equity) == 0 {
 		return decimal.Zero
 	}
