@@ -21,6 +21,10 @@ import (
 
 const persistInterval = 3 * time.Second
 
+// maxConsecutiveErrors stops a bot whose strategy keeps failing (e.g. every
+// order rejected) instead of letting it retry indefinitely.
+const maxConsecutiveErrors = 10
+
 // Manager owns all running bot workers.
 type Manager struct {
 	engine  *engine.Client
@@ -28,11 +32,14 @@ type Manager struct {
 	store   *store.Store
 	mu      sync.Mutex
 	workers map[string]*worker
+	// starting holds bot IDs mid-Start so concurrent Start calls for the same
+	// bot cannot both pass the duplicate check while store I/O is in flight.
+	starting map[string]struct{}
 }
 
 // NewManager builds a manager.
 func NewManager(engineClient *engine.Client, hub *marketdata.Hub, st *store.Store) *Manager {
-	return &Manager{engine: engineClient, hub: hub, store: st, workers: map[string]*worker{}}
+	return &Manager{engine: engineClient, hub: hub, store: st, workers: map[string]*worker{}, starting: map[string]struct{}{}}
 }
 
 // StartAll resumes every bot marked running in the database.
@@ -51,13 +58,25 @@ func (m *Manager) StartAll(ctx context.Context) {
 }
 
 // Start builds and runs a bot. Safe to call on an already-running bot.
+// Concurrent Start calls for the same bot are serialized via the starting set:
+// exactly one proceeds, the rest return immediately.
 func (m *Manager) Start(ctx context.Context, botID string) error {
 	m.mu.Lock()
 	if _, ok := m.workers[botID]; ok {
 		m.mu.Unlock()
 		return nil // already running
 	}
+	if _, ok := m.starting[botID]; ok {
+		m.mu.Unlock()
+		return nil // another Start is already in flight
+	}
+	m.starting[botID] = struct{}{}
 	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.starting, botID)
+		m.mu.Unlock()
+	}()
 
 	bot, err := m.store.Get(ctx, botID)
 	if err != nil {
@@ -68,14 +87,21 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 		_ = m.store.UpdateStatus(ctx, botID, models.StatusError, err.Error())
 		return err
 	}
-	// Restore persisted state (if any) into the strategy.
+	// Restore persisted state (if any) into the strategy. A restore failure
+	// means the persisted state is corrupt — surface it and refuse to run
+	// rather than silently trading from a blank state.
 	if len(bot.State) > 0 {
 		var st strategy.State
-		if raw, merr := json.Marshal(bot.State); merr == nil {
-			if uerr := json.Unmarshal(raw, &st); uerr == nil {
-				strat.Restore(st)
-			}
+		raw, merr := json.Marshal(bot.State)
+		if merr != nil {
+			_ = m.store.UpdateStatus(ctx, botID, models.StatusError, "persisted state unreadable: "+merr.Error())
+			return merr
 		}
+		if uerr := json.Unmarshal(raw, &st); uerr != nil {
+			_ = m.store.UpdateStatus(ctx, botID, models.StatusError, "persisted state corrupt: "+uerr.Error())
+			return uerr
+		}
+		strat.Restore(st)
 	}
 	if err := m.store.MarkRunning(ctx, botID); err != nil {
 		return err
@@ -100,6 +126,9 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 func (m *Manager) Stop(ctx context.Context, botID string) error {
 	m.mu.Lock()
 	w, ok := m.workers[botID]
+	if ok {
+		delete(m.workers, botID) // claim teardown while holding the lock
+	}
 	m.mu.Unlock()
 	if !ok {
 		// Not running; just ensure the DB reflects stopped.
@@ -108,9 +137,6 @@ func (m *Manager) Stop(ctx context.Context, botID string) error {
 	close(w.stopCh)
 	<-w.doneCh
 	m.hub.Unsubscribe(w.bot.Symbol, string(w.bot.Market), w.wakeCh)
-	m.mu.Lock()
-	delete(m.workers, botID)
-	m.mu.Unlock()
 	return m.store.MarkStopped(ctx, botID)
 }
 
@@ -145,6 +171,8 @@ type worker struct {
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 	startedAt time.Time
+	// consecutiveErrors counts back-to-back OnTick failures; reset on success.
+	consecutiveErrors int
 }
 
 func (w *worker) run() {
@@ -158,22 +186,55 @@ func (w *worker) run() {
 			w.shutdown(ctx)
 			return
 		case <-w.wakeCh:
-			w.tick(ctx)
+			if halted := w.tick(ctx); halted {
+				w.shutdown(ctx)
+				go w.manager.remove(w) // detach off the worker goroutine; Stop would deadlock here
+				return
+			}
 		case <-persist.C:
 			w.persist(ctx)
 		}
 	}
 }
 
-func (w *worker) tick(ctx context.Context) {
+// remove unregisters a self-stopped worker (already shut down) from the
+// manager and hub. Runs on its own goroutine, so taking the lock is safe.
+// If Stop already claimed the worker (deleted it from the map), teardown is
+// Stop's responsibility and remove does nothing.
+func (m *Manager) remove(w *worker) {
+	m.mu.Lock()
+	cur, ok := m.workers[w.bot.ID]
+	if ok && cur == w {
+		delete(m.workers, w.bot.ID)
+	}
+	m.mu.Unlock()
+	if ok && cur == w {
+		m.hub.Unsubscribe(w.bot.Symbol, string(w.bot.Market), w.wakeCh)
+	}
+}
+
+// tick runs one strategy iteration. Returns true when the bot has failed too
+// many times in a row and must stop.
+func (w *worker) tick(ctx context.Context) (halt bool) {
 	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
 	deps := strategy.Deps{
 		Engine: w.manager.engine, Account: w.bot.WalletAddress,
 		Bot: w.bot, MD: md,
 	}
 	if err := w.strategy.OnTick(ctx, deps); err != nil {
-		slog.Warn("bot tick error", "id", w.bot.ID, "strategy", w.bot.Strategy, "error", err)
+		w.consecutiveErrors++
+		slog.Warn("bot tick error", "id", w.bot.ID, "strategy", w.bot.Strategy,
+			"consecutive", w.consecutiveErrors, "error", err)
+		if w.consecutiveErrors >= maxConsecutiveErrors {
+			slog.Error("bot stopped after repeated errors", "id", w.bot.ID, "errors", w.consecutiveErrors)
+			_ = w.manager.store.UpdateStatus(ctx, w.bot.ID, models.StatusError,
+				"stopped after repeated tick errors; last: "+err.Error())
+			return true
+		}
+		return false
 	}
+	w.consecutiveErrors = 0
+	return false
 }
 
 func (w *worker) persist(ctx context.Context) {

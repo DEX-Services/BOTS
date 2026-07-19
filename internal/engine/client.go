@@ -171,7 +171,7 @@ func (c *Client) Ticker(ctx context.Context, symbol, market string) (Ticker, err
 	if err != nil {
 		return Ticker{}, err
 	}
-	return parseTicker(body), nil
+	return parseTicker(body)
 }
 
 // Balance fetches the in-memory ledger balance for an account/asset.
@@ -251,30 +251,36 @@ func (c *Client) do(req *http.Request, out any) error {
 }
 
 // parseTicker parses "symbol=BTC-USDT market=spot bid=.. ask=.. mid=.. spread=..".
-func parseTicker(s string) Ticker {
+// A malformed numeric field is a hard error: silently coercing an unparseable
+// price to zero would feed bots a fake market (bid/ask of 0), so surface it.
+func parseTicker(s string) (Ticker, error) {
 	t := Ticker{}
 	for _, field := range strings.Fields(strings.TrimSpace(s)) {
 		k, v, ok := strings.Cut(field, "=")
 		if !ok {
 			continue
 		}
+		var err error
 		switch k {
 		case "symbol":
 			t.Symbol = v
 		case "market":
 			t.Market = v
 		case "bid":
-			t.Bid, _ = decimal.NewFromString(v)
+			t.Bid, err = decimal.NewFromString(v)
 		case "ask":
-			t.Ask, _ = decimal.NewFromString(v)
+			t.Ask, err = decimal.NewFromString(v)
 		case "mid":
-			t.Mid, _ = decimal.NewFromString(v)
+			t.Mid, err = decimal.NewFromString(v)
 		case "spread":
-			t.Spread, _ = decimal.NewFromString(v)
+			t.Spread, err = decimal.NewFromString(v)
+		}
+		if err != nil {
+			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", k, v, err)
 		}
 	}
 	if t.Mid.IsZero() && !t.Bid.IsZero() && !t.Ask.IsZero() {
 		t.Mid = t.Bid.Add(t.Ask).Div(decimal.NewFromInt(2))
 	}
-	return t
+	return t, nil
 }

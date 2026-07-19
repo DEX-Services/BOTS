@@ -183,9 +183,15 @@ func (s *Store) MarkStopped(ctx context.Context, id string) error {
 
 // SaveState persists the runtime state and computed stats for a bot.
 func (s *Store) SaveState(ctx context.Context, id string, state any, stats models.Stats) error {
-	sb, _ := json.Marshal(state)
-	stb, _ := json.Marshal(stats)
-	_, err := s.pool.Exec(ctx, `UPDATE bots SET state=$2, stats=$3, updated_at=now() WHERE id=$1`, id, sb, stb)
+	sb, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal bot state: %w", err)
+	}
+	stb, err := json.Marshal(stats)
+	if err != nil {
+		return fmt.Errorf("marshal bot stats: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `UPDATE bots SET state=$2, stats=$3, updated_at=now() WHERE id=$1`, id, sb, stb)
 	return err
 }
 
@@ -222,12 +228,26 @@ func scanBot(row scanner) (*models.Bot, error) {
 	b.Market = models.Market(market)
 	b.StartedAt = startedAt
 	b.StoppedAt = stoppedAt
-	_ = json.Unmarshal(config, &b.Config)
+	// Corrupt persisted JSON must surface, not silently become defaults: a bot
+	// resumed with an empty state would re-place orders it already placed.
+	if len(config) > 0 {
+		if err := json.Unmarshal(config, &b.Config); err != nil {
+			return nil, fmt.Errorf("bot %s: corrupt config JSON: %w", b.ID, err)
+		}
+	}
 	if b.Config == nil {
 		b.Config = map[string]string{}
 	}
-	_ = json.Unmarshal(state, &b.State)
-	_ = json.Unmarshal(stats, &b.Stats)
+	if len(state) > 0 {
+		if err := json.Unmarshal(state, &b.State); err != nil {
+			return nil, fmt.Errorf("bot %s: corrupt state JSON: %w", b.ID, err)
+		}
+	}
+	if len(stats) > 0 {
+		if err := json.Unmarshal(stats, &b.Stats); err != nil {
+			return nil, fmt.Errorf("bot %s: corrupt stats JSON: %w", b.ID, err)
+		}
+	}
 	if b.State == nil {
 		b.State = map[string]any{}
 	}
@@ -236,7 +256,9 @@ func scanBot(row scanner) (*models.Bot, error) {
 
 func scanBots(rows rowScanner) ([]models.Bot, error) {
 	defer rows.Close()
-	var out []models.Bot
+	// Non-nil so the JSON API serializes "bots":[] rather than "bots":null on an
+	// empty result; the frontend indexes .bots.length directly.
+	out := []models.Bot{}
 	for rows.Next() {
 		b, err := scanBot(rows)
 		if err != nil {
