@@ -7,6 +7,7 @@ package engine
 
 import (
 	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +25,9 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 	sem     chan struct{}
+	// engineSecret authenticates privileged calls (/internal/ledger/sync).
+	// Empty ⇒ LedgerSync returns an error rather than calling unauthenticated.
+	engineSecret string
 }
 
 // NewClient builds an engine client. concurrency bounds in-flight calls.
@@ -43,6 +47,47 @@ func NewClient(baseURL string, concurrency int) *Client {
 		},
 		sem: make(chan struct{}, concurrency),
 	}
+}
+
+// SetEngineSecret sets the shared secret used to authenticate privileged
+// engine calls (/internal/ledger/sync). Call once at startup.
+func (c *Client) SetEngineSecret(secret string) { c.engineSecret = secret }
+
+// LedgerSync credits or debits an account's in-memory engine ledger balance
+// via /internal/ledger/sync. direction must be "credit" or "debit". Used by
+// the market-maker funding layer to fund/defund MM wallets. Returns an error
+// if the engine secret is unset or the engine rejects the change (e.g. a debit
+// exceeding balance).
+func (c *Client) LedgerSync(ctx context.Context, account, asset, amount, direction string) error {
+	if c.engineSecret == "" {
+		return fmt.Errorf("engine secret not configured; cannot sync ledger")
+	}
+	body, err := json.Marshal(map[string]string{
+		"accountId": account, "asset": asset, "amount": amount, "direction": direction,
+	})
+	if err != nil {
+		return err
+	}
+	if err := c.acquire(ctx); err != nil {
+		return err
+	}
+	defer c.release()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/ledger/sync", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Engine-Secret", c.engineSecret)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("engine ledger sync %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 
 func (c *Client) acquire(ctx context.Context) error {
@@ -152,6 +197,33 @@ func (c *Client) OpenOrders(ctx context.Context, account string) ([]OpenOrder, e
 		return nil, err
 	}
 	return resp.Orders, nil
+}
+
+// OrderStatus is the engine's reply for GET /order/status: the real, current
+// state of one order. Found is false when neither the live book nor the durable
+// record knows the order (e.g. not yet flushed); Resting is true only while it
+// is still on the book. Filled is the authoritative filled quantity — callers
+// account against it instead of assuming a vanished order filled in full.
+type OrderStatus struct {
+	OrderID string `json:"orderId"`
+	Found   bool   `json:"found"`
+	Resting bool   `json:"resting"`
+	Status  string `json:"status"`
+	Filled  string `json:"filled"`
+}
+
+// OrderStatusByID fetches one order's authoritative state. symbol/market let the
+// engine check the correct live book first before falling back to Postgres.
+func (c *Client) OrderStatusByID(ctx context.Context, symbol, market, orderID string) (OrderStatus, error) {
+	q := url.Values{}
+	q.Set("id", orderID)
+	q.Set("symbol", symbol)
+	q.Set("market", market)
+	var out OrderStatus
+	if err := c.get(ctx, "/order/status?"+q.Encode(), &out); err != nil {
+		return OrderStatus{}, err
+	}
+	return out, nil
 }
 
 // FuturesPositions returns the account's open futures positions.

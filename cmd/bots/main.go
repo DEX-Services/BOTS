@@ -19,9 +19,12 @@ import (
 
 	"github.com/dex/bots/internal/api"
 	"github.com/dex/bots/internal/auth"
+	"github.com/dex/bots/internal/backend"
 	"github.com/dex/bots/internal/config"
 	"github.com/dex/bots/internal/engine"
+	"github.com/dex/bots/internal/index"
 	"github.com/dex/bots/internal/marketdata"
+	"github.com/dex/bots/internal/mm"
 	"github.com/dex/bots/internal/runtime"
 	"github.com/dex/bots/internal/store"
 	"github.com/joho/godotenv"
@@ -51,11 +54,55 @@ func main() {
 	slog.Info("postgres connected")
 
 	engineClient := engine.NewClient(cfg.EngineURL, cfg.EngineConcurrency)
+	engineClient.SetEngineSecret(cfg.EngineSecret)
+	backendClient := backend.NewClient(cfg.BackendURL, cfg.EngineSecret)
 	hub := marketdata.NewHub(engineClient, cfg.MarketDataPoll())
-	manager := runtime.NewManager(engineClient, hub, st)
+
+	// Index reader for market-maker bots. Optional: if REDIS_SERVICE_URI is
+	// unset or unreachable, MM bots receive a stale snapshot and refuse to
+	// quote, but every other strategy runs unaffected.
+	var idx *index.Reader
+	if cfg.RedisURI != "" {
+		idx, err = index.New(ctx, cfg.RedisURI, cfg.IndexPrefix, time.Duration(cfg.IndexMaxAgeMs)*time.Millisecond)
+		if err != nil {
+			slog.Warn("index price reader unavailable; market-maker bots will not quote", "error", err)
+			idx = nil
+		} else {
+			slog.Info("index price reader connected", "prefix", cfg.IndexPrefix)
+		}
+	} else {
+		slog.Warn("REDIS_SERVICE_URI unset; market-maker bots will not quote")
+	}
+
+	manager := runtime.NewManager(engineClient, hub, st, idx)
+
+	// Market-maker funding service. Recredit restores each desk's engine-ledger
+	// balance from the DB (the ledger is in-memory and wiped on engine restart)
+	// before any bot resumes quoting.
+	mmSvc := mm.NewService(st, engineClient, backendClient, manager)
+	// The engine may still be booting when bots starts (its in-memory ledger
+	// isn't ready to accept credits yet), so retry in the background instead of
+	// giving up after one connection-refused. Runs off the request path so the
+	// API still comes up immediately.
+	go func() {
+		for attempt := 1; attempt <= 30; attempt++ {
+			if err := mmSvc.Recredit(ctx); err != nil {
+				slog.Warn("market-maker ledger recredit failed; retrying", "attempt", attempt, "error", err)
+				select {
+				case <-time.After(2 * time.Second):
+					continue
+				case <-ctx.Done():
+					return
+				}
+			}
+			slog.Info("market-maker ledger recredited", "attempt", attempt)
+			return
+		}
+		slog.Error("market-maker ledger recredit gave up; desks will under-quote until re-funded")
+	}()
 
 	verifier := auth.NewVerifier(cfg.JWTSecret)
-	server := api.NewServer(st, manager, verifier)
+	server := api.NewServer(st, manager, verifier, mmSvc)
 	handler := api.CORS(cfg.AllowedOrigins, server.Routes())
 
 	// Resume bots that were running before a restart.

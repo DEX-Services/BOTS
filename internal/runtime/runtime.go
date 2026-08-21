@@ -8,10 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/dex/bots/internal/engine"
+	"github.com/dex/bots/internal/index"
 	"github.com/dex/bots/internal/marketdata"
 	"github.com/dex/bots/internal/models"
 	"github.com/dex/bots/internal/store"
@@ -30,6 +32,9 @@ type Manager struct {
 	engine  *engine.Client
 	hub     *marketdata.Hub
 	store   *store.Store
+	// index reads the shared index price for market-maker bots. May be nil
+	// when no Redis is configured; strategies that need it get a zero snapshot.
+	index   *index.Reader
 	mu      sync.Mutex
 	workers map[string]*worker
 	// starting holds bot IDs mid-Start so concurrent Start calls for the same
@@ -37,9 +42,10 @@ type Manager struct {
 	starting map[string]struct{}
 }
 
-// NewManager builds a manager.
-func NewManager(engineClient *engine.Client, hub *marketdata.Hub, st *store.Store) *Manager {
-	return &Manager{engine: engineClient, hub: hub, store: st, workers: map[string]*worker{}, starting: map[string]struct{}{}}
+// NewManager builds a manager. idx may be nil (index-dependent strategies then
+// receive a stale/zero snapshot and refuse to quote).
+func NewManager(engineClient *engine.Client, hub *marketdata.Hub, st *store.Store, idx *index.Reader) *Manager {
+	return &Manager{engine: engineClient, hub: hub, store: st, index: idx, workers: map[string]*worker{}, starting: map[string]struct{}{}}
 }
 
 // StartAll resumes every bot marked running in the database.
@@ -213,13 +219,40 @@ func (m *Manager) remove(w *worker) {
 	}
 }
 
+// indexSnapshot returns the current index-price snapshot for a symbol's base
+// asset, or a zero (stale) snapshot when no index reader is configured.
+func (m *Manager) indexSnapshot(ctx context.Context, symbol string) index.Snapshot {
+	if m.index == nil {
+		return index.Snapshot{}
+	}
+	return m.index.Get(ctx, baseAsset(symbol), time.Now().UnixMilli())
+}
+
+// IndexSnapshot exposes the index snapshot for a symbol to callers outside the
+// runtime (e.g. the MM admin API computing marked P/L). Returns a zero (stale)
+// snapshot when no index reader is configured.
+func (m *Manager) IndexSnapshot(ctx context.Context, symbol string) index.Snapshot {
+	return m.indexSnapshot(ctx, symbol)
+}
+
+// baseAsset extracts the base symbol from a pair like "BTC-USDC" -> "BTC".
+func baseAsset(symbol string) string {
+	s := strings.ToUpper(strings.TrimSpace(symbol))
+	for _, sep := range []string{"-", "/", "_"} {
+		if i := strings.Index(s, sep); i > 0 {
+			return s[:i]
+		}
+	}
+	return s
+}
+
 // tick runs one strategy iteration. Returns true when the bot has failed too
 // many times in a row and must stop.
 func (w *worker) tick(ctx context.Context) (halt bool) {
 	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
 	deps := strategy.Deps{
 		Engine: w.manager.engine, Account: w.bot.WalletAddress,
-		Bot: w.bot, MD: md,
+		Bot: w.bot, MD: md, Index: w.manager.indexSnapshot(ctx, w.bot.Symbol),
 	}
 	if err := w.strategy.OnTick(ctx, deps); err != nil {
 		w.consecutiveErrors++
