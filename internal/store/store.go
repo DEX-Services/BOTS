@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 )
 
 // ErrNotFound is returned when a bot id does not exist.
@@ -43,12 +44,47 @@ func New(ctx context.Context, uri string) (*Store, error) {
 	if err := s.migrate(ctx); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	if err := s.migrateMM(ctx); err != nil {
+		return nil, fmt.Errorf("migrate mm: %w", err)
+	}
 	return s, nil
 }
 
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, schema)
 	return err
+}
+
+// SymbolTradable reports whether the engine has an active order book for this
+// (symbol, market) pair. It reads symbol_configs — the same table the matching
+// engine loads its books from — so a desk can't be created against a market
+// that will never accept its orders.
+func (s *Store) SymbolTradable(ctx context.Context, symbol, market string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM symbol_configs
+			WHERE symbol = $1 AND market = $2 AND active = true
+		)`, symbol, market).Scan(&ok)
+	return ok, err
+}
+
+// SymbolRules returns the engine's tick_size and lot_size for a (symbol, market)
+// pair from symbol_configs — the price/qty granularity the matching engine
+// enforces. MM quotes must be snapped to these or the engine rejects them as
+// "not a multiple of tick size". Returns ErrMMNotFound-free zero values only on
+// query error; callers treat a zero tick/lot as "no rounding".
+func (s *Store) SymbolRules(ctx context.Context, symbol, market string) (tick, lot decimal.Decimal, err error) {
+	var t, l string
+	err = s.pool.QueryRow(ctx, `
+		SELECT tick_size, lot_size FROM symbol_configs
+		WHERE symbol = $1 AND market = $2 AND active = true`, symbol, market).Scan(&t, &l)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, err
+	}
+	tick, _ = decimal.NewFromString(t)
+	lot, _ = decimal.NewFromString(l)
+	return tick, lot, nil
 }
 
 const schema = `
@@ -183,15 +219,39 @@ func (s *Store) MarkStopped(ctx context.Context, id string) error {
 
 // SaveState persists the runtime state and computed stats for a bot.
 func (s *Store) SaveState(ctx context.Context, id string, state any, stats models.Stats) error {
-	sb, _ := json.Marshal(state)
-	stb, _ := json.Marshal(stats)
-	_, err := s.pool.Exec(ctx, `UPDATE bots SET state=$2, stats=$3, updated_at=now() WHERE id=$1`, id, sb, stb)
+	sb, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal bot state: %w", err)
+	}
+	stb, err := json.Marshal(stats)
+	if err != nil {
+		return fmt.Errorf("marshal bot stats: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `UPDATE bots SET state=$2, stats=$3, updated_at=now() WHERE id=$1`, id, sb, stb)
 	return err
 }
 
 // Delete removes a bot row.
 func (s *Store) Delete(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM bots WHERE id=$1`, id)
+	return err
+}
+
+// UpdateInvestment sets a bot's quote budget. Used by the MM funding layer to
+// keep bots.investment in step with the desk's allocated_usdc.
+func (s *Store) UpdateInvestment(ctx context.Context, id, investment string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE bots SET investment=$2, updated_at=now() WHERE id=$1`, id, investment)
+	return err
+}
+
+// UpdateConfig replaces a bot's strategy config JSON. Used by the MM admin API
+// to retune spread/levels; the manager rebuilds the strategy on next start.
+func (s *Store) UpdateConfig(ctx context.Context, id string, config map[string]string) error {
+	cb, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal bot config: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `UPDATE bots SET config=$2, updated_at=now() WHERE id=$1`, id, cb)
 	return err
 }
 
@@ -222,12 +282,26 @@ func scanBot(row scanner) (*models.Bot, error) {
 	b.Market = models.Market(market)
 	b.StartedAt = startedAt
 	b.StoppedAt = stoppedAt
-	_ = json.Unmarshal(config, &b.Config)
+	// Corrupt persisted JSON must surface, not silently become defaults: a bot
+	// resumed with an empty state would re-place orders it already placed.
+	if len(config) > 0 {
+		if err := json.Unmarshal(config, &b.Config); err != nil {
+			return nil, fmt.Errorf("bot %s: corrupt config JSON: %w", b.ID, err)
+		}
+	}
 	if b.Config == nil {
 		b.Config = map[string]string{}
 	}
-	_ = json.Unmarshal(state, &b.State)
-	_ = json.Unmarshal(stats, &b.Stats)
+	if len(state) > 0 {
+		if err := json.Unmarshal(state, &b.State); err != nil {
+			return nil, fmt.Errorf("bot %s: corrupt state JSON: %w", b.ID, err)
+		}
+	}
+	if len(stats) > 0 {
+		if err := json.Unmarshal(stats, &b.Stats); err != nil {
+			return nil, fmt.Errorf("bot %s: corrupt stats JSON: %w", b.ID, err)
+		}
+	}
 	if b.State == nil {
 		b.State = map[string]any{}
 	}
@@ -236,7 +310,9 @@ func scanBot(row scanner) (*models.Bot, error) {
 
 func scanBots(rows rowScanner) ([]models.Bot, error) {
 	defer rows.Close()
-	var out []models.Bot
+	// Non-nil so the JSON API serializes "bots":[] rather than "bots":null on an
+	// empty result; the frontend indexes .bots.length directly.
+	out := []models.Bot{}
 	for rows.Next() {
 		b, err := scanBot(rows)
 		if err != nil {

@@ -14,10 +14,24 @@ type Config struct {
 	Port              string
 	JWTSecret         string
 	EngineURL         string
+	BackendURL        string
 	PostgresURI       string
 	AllowedOrigins    map[string]bool
 	MarketDataPollMs  int
 	EngineConcurrency int
+
+	// RedisURI / IndexPrefix / IndexMaxAgeMs configure the index-price reader
+	// used by market-maker bots. RedisURI empty ⇒ the reader is disabled and
+	// market_maker bots refuse to start.
+	RedisURI      string
+	IndexPrefix   string
+	IndexMaxAgeMs int
+
+	// EngineSecret authenticates privileged engine calls (/internal/ledger/sync)
+	// and Dex-Backend balance calls (/internal/balance/credit) used by the
+	// market-maker funding layer. Must match the engine's and Dex-Backend's
+	// DEX_BACKEND_ENGINE_SECRET / ENGINE_SHARED_SECRET. Empty ⇒ MM funding fails.
+	EngineSecret string
 }
 
 // Load reads configuration from environment variables (and .env if present).
@@ -26,10 +40,15 @@ func Load() (Config, error) {
 		Port:              getenv("BOTS_PORT", "8082"),
 		JWTSecret:        os.Getenv("JWT_SECRET"),
 		EngineURL:        getenv("ENGINE_URL", "http://localhost:8080"),
+		BackendURL:       getenv("BACKEND_URL", "http://localhost:8081"),
 		PostgresURI:      postgresURI(),
 		AllowedOrigins:   parseOrigins(os.Getenv("BOTS_ALLOWED_ORIGINS")),
 		MarketDataPollMs: getenvInt("MARKETDATA_POLL_MS", 800),
 		EngineConcurrency: getenvInt("ENGINE_MAX_CONCURRENCY", 256),
+		RedisURI:         os.Getenv("REDIS_SERVICE_URI"),
+		IndexPrefix:      getenv("INDEX_KEY_PREFIX", "price"),
+		IndexMaxAgeMs:    getenvInt("INDEX_MAX_AGE_MS", 5000),
+		EngineSecret:     os.Getenv("DEX_BACKEND_ENGINE_SECRET"),
 	}
 	if c.JWTSecret == "" {
 		return c, fmt.Errorf("JWT_SECRET is required (must match Dex-Backend)")

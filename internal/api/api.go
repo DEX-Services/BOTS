@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/dex/bots/internal/auth"
+	"github.com/dex/bots/internal/mm"
 	"github.com/dex/bots/internal/models"
 	"github.com/dex/bots/internal/runtime"
 	"github.com/dex/bots/internal/store"
@@ -17,11 +18,12 @@ type Server struct {
 	store   *store.Store
 	manager *runtime.Manager
 	auth    *auth.Verifier
+	mm      *mm.Service
 }
 
 // NewServer builds the API server.
-func NewServer(st *store.Store, mgr *runtime.Manager, v *auth.Verifier) *Server {
-	return &Server{store: st, manager: mgr, auth: v}
+func NewServer(st *store.Store, mgr *runtime.Manager, v *auth.Verifier, mmSvc *mm.Service) *Server {
+	return &Server{store: st, manager: mgr, auth: v, mm: mmSvc}
 }
 
 // Routes returns the HTTP mux with all endpoints wired. Public routes
@@ -33,6 +35,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /bots/templates", methodGuard(http.MethodGet, s.handleTemplates))
 	mux.HandleFunc("GET /bots/marketplace", methodGuard(http.MethodGet, s.handleMarketplace))
 
+	// Public index price sourced from Redis (the price-fetcher's INDEX). Served
+	// so the frontend header reads the same number the MM quotes and marks P/L
+	// against, instead of an independent Binance REST poll.
+	mux.HandleFunc("GET /index/{base}", methodGuard(http.MethodGet, s.handleIndex))
+
 	mux.HandleFunc("GET /bots", s.requireAuth(methodGuard(http.MethodGet, s.handleList)))
 	mux.HandleFunc("POST /bots", s.requireAuth(methodGuard(http.MethodPost, s.handleCreate)))
 
@@ -41,6 +48,22 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /bots/{id}/stop", s.requireAuth(methodGuard(http.MethodPost, s.handleStop)))
 	mux.HandleFunc("DELETE /bots/{id}", s.requireAuth(methodGuard(http.MethodDelete, s.handleDelete)))
 	mux.HandleFunc("POST /bots/{id}/copy", s.requireAuth(methodGuard(http.MethodPost, s.handleCopy)))
+
+	// ----- admin: market-maker desks -----
+	// Admin identity is a shared-secret session JWT (uid="admin") issued by
+	// Dex-Backend; requireAdmin gates every desk route.
+	mux.HandleFunc("GET /admin/mm", s.requireAdmin(methodGuard(http.MethodGet, s.handleMMList)))
+	mux.HandleFunc("POST /admin/mm", s.requireAdmin(methodGuard(http.MethodPost, s.handleMMCreate)))
+	mux.HandleFunc("POST /admin/mm/start-all", s.requireAdmin(methodGuard(http.MethodPost, s.handleMMStartAll)))
+	mux.HandleFunc("POST /admin/mm/stop-all", s.requireAdmin(methodGuard(http.MethodPost, s.handleMMStopAll)))
+	mux.HandleFunc("GET /admin/mm/{id}", s.requireAdmin(methodGuard(http.MethodGet, s.handleMMGet)))
+	mux.HandleFunc("DELETE /admin/mm/{id}", s.requireAdmin(methodGuard(http.MethodDelete, s.handleMMDelete)))
+	mux.HandleFunc("PATCH /admin/mm/{id}", s.requireAdmin(methodGuard(http.MethodPatch, s.handleMMConfig)))
+	mux.HandleFunc("POST /admin/mm/{id}/deposit", s.requireAdmin(methodGuard(http.MethodPost, s.handleMMDeposit)))
+	mux.HandleFunc("POST /admin/mm/{id}/withdraw", s.requireAdmin(methodGuard(http.MethodPost, s.handleMMWithdraw)))
+	mux.HandleFunc("POST /admin/mm/{id}/enable", s.requireAdmin(methodGuard(http.MethodPost, s.handleMMEnable)))
+	mux.HandleFunc("GET /admin/mm/{id}/orders", s.requireAdmin(methodGuard(http.MethodGet, s.handleMMOrders)))
+	mux.HandleFunc("GET /admin/mm/{id}/history", s.requireAdmin(methodGuard(http.MethodGet, s.handleMMHistory)))
 
 	return mux
 }
@@ -51,6 +74,23 @@ func (s *Server) Routes() http.Handler {
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auth.Middleware(s.auth, false, next).ServeHTTP(w, r)
+	}
+}
+
+// requireAdmin wraps a handler with JWT verification AND an admin-identity
+// check. The admin session is a shared-secret JWT minted by Dex-Backend with
+// uid="admin"; any other identity is rejected 403.
+func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	guarded := func(w http.ResponseWriter, r *http.Request) {
+		claims := auth.FromRequest(r)
+		if claims == nil || claims.UserID != "admin" {
+			writeErr(w, http.StatusForbidden, "admin access required")
+			return
+		}
+		next(w, r)
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth.Middleware(s.auth, false, http.HandlerFunc(guarded)).ServeHTTP(w, r)
 	}
 }
 
@@ -69,6 +109,35 @@ func (s *Server) handleMarketplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"bots": bots})
+}
+
+// handleIndex serves the Redis-backed INDEX price for a base asset (e.g. BTC).
+// This is the same snapshot the MM quotes and marks P/L against, exposed so the
+// frontend header stays consistent with the desk and the engine's mark price.
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	// NOT upper-cased: this ticker is used verbatim as the Redis key
+	// suffix (via IndexSnapshotExact). Most tickers price-fetcher writes
+	// ARE upper-case (BTC, EURUSD, GOLD), so callers sending those still
+	// work identically to before — but Live-Rates.com stock tickers are
+	// stored with a case-sensitive suffix ("AAPL.us"), and forcing upper
+	// case here used to make every stock lookup silently miss
+	// ("price:AAPL.US" was never a real key).
+	base := strings.TrimSpace(r.PathValue("base"))
+	if base == "" {
+		writeErr(w, http.StatusBadRequest, "base required")
+		return
+	}
+	snap := s.manager.IndexSnapshotExact(r.Context(), base)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"base":          base,
+		"price":         snap.Price.String(),
+		"fresh":         snap.Fresh,
+		"ageMs":         snap.AgeMs,
+		"changePercent": snap.ChangePercent,
+		"high":          snap.High24h,
+		"low":           snap.Low24h,
+		"quoteVolume":   snap.QuoteVolume,
+	})
 }
 
 // ----- authed -----

@@ -7,6 +7,7 @@ package engine
 
 import (
 	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +25,9 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 	sem     chan struct{}
+	// engineSecret authenticates privileged calls (/internal/ledger/sync).
+	// Empty ⇒ LedgerSync returns an error rather than calling unauthenticated.
+	engineSecret string
 }
 
 // NewClient builds an engine client. concurrency bounds in-flight calls.
@@ -43,6 +47,47 @@ func NewClient(baseURL string, concurrency int) *Client {
 		},
 		sem: make(chan struct{}, concurrency),
 	}
+}
+
+// SetEngineSecret sets the shared secret used to authenticate privileged
+// engine calls (/internal/ledger/sync). Call once at startup.
+func (c *Client) SetEngineSecret(secret string) { c.engineSecret = secret }
+
+// LedgerSync credits or debits an account's in-memory engine ledger balance
+// via /internal/ledger/sync. direction must be "credit" or "debit". Used by
+// the market-maker funding layer to fund/defund MM wallets. Returns an error
+// if the engine secret is unset or the engine rejects the change (e.g. a debit
+// exceeding balance).
+func (c *Client) LedgerSync(ctx context.Context, account, asset, amount, direction string) error {
+	if c.engineSecret == "" {
+		return fmt.Errorf("engine secret not configured; cannot sync ledger")
+	}
+	body, err := json.Marshal(map[string]string{
+		"accountId": account, "asset": asset, "amount": amount, "direction": direction,
+	})
+	if err != nil {
+		return err
+	}
+	if err := c.acquire(ctx); err != nil {
+		return err
+	}
+	defer c.release()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/ledger/sync", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Engine-Secret", c.engineSecret)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("engine ledger sync %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 
 func (c *Client) acquire(ctx context.Context) error {
@@ -154,6 +199,33 @@ func (c *Client) OpenOrders(ctx context.Context, account string) ([]OpenOrder, e
 	return resp.Orders, nil
 }
 
+// OrderStatus is the engine's reply for GET /order/status: the real, current
+// state of one order. Found is false when neither the live book nor the durable
+// record knows the order (e.g. not yet flushed); Resting is true only while it
+// is still on the book. Filled is the authoritative filled quantity — callers
+// account against it instead of assuming a vanished order filled in full.
+type OrderStatus struct {
+	OrderID string `json:"orderId"`
+	Found   bool   `json:"found"`
+	Resting bool   `json:"resting"`
+	Status  string `json:"status"`
+	Filled  string `json:"filled"`
+}
+
+// OrderStatusByID fetches one order's authoritative state. symbol/market let the
+// engine check the correct live book first before falling back to Postgres.
+func (c *Client) OrderStatusByID(ctx context.Context, symbol, market, orderID string) (OrderStatus, error) {
+	q := url.Values{}
+	q.Set("id", orderID)
+	q.Set("symbol", symbol)
+	q.Set("market", market)
+	var out OrderStatus
+	if err := c.get(ctx, "/order/status?"+q.Encode(), &out); err != nil {
+		return OrderStatus{}, err
+	}
+	return out, nil
+}
+
 // FuturesPositions returns the account's open futures positions.
 func (c *Client) FuturesPositions(ctx context.Context, account string) ([]FuturesPosition, error) {
 	var resp struct {
@@ -171,7 +243,7 @@ func (c *Client) Ticker(ctx context.Context, symbol, market string) (Ticker, err
 	if err != nil {
 		return Ticker{}, err
 	}
-	return parseTicker(body), nil
+	return parseTicker(body)
 }
 
 // Balance fetches the in-memory ledger balance for an account/asset.
@@ -251,30 +323,36 @@ func (c *Client) do(req *http.Request, out any) error {
 }
 
 // parseTicker parses "symbol=BTC-USDT market=spot bid=.. ask=.. mid=.. spread=..".
-func parseTicker(s string) Ticker {
+// A malformed numeric field is a hard error: silently coercing an unparseable
+// price to zero would feed bots a fake market (bid/ask of 0), so surface it.
+func parseTicker(s string) (Ticker, error) {
 	t := Ticker{}
 	for _, field := range strings.Fields(strings.TrimSpace(s)) {
 		k, v, ok := strings.Cut(field, "=")
 		if !ok {
 			continue
 		}
+		var err error
 		switch k {
 		case "symbol":
 			t.Symbol = v
 		case "market":
 			t.Market = v
 		case "bid":
-			t.Bid, _ = decimal.NewFromString(v)
+			t.Bid, err = decimal.NewFromString(v)
 		case "ask":
-			t.Ask, _ = decimal.NewFromString(v)
+			t.Ask, err = decimal.NewFromString(v)
 		case "mid":
-			t.Mid, _ = decimal.NewFromString(v)
+			t.Mid, err = decimal.NewFromString(v)
 		case "spread":
-			t.Spread, _ = decimal.NewFromString(v)
+			t.Spread, err = decimal.NewFromString(v)
+		}
+		if err != nil {
+			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", k, v, err)
 		}
 	}
 	if t.Mid.IsZero() && !t.Bid.IsZero() && !t.Ask.IsZero() {
 		t.Mid = t.Bid.Add(t.Ask).Div(decimal.NewFromInt(2))
 	}
-	return t
+	return t, nil
 }

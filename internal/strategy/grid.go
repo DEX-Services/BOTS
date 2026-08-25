@@ -170,42 +170,64 @@ func (g *grid) place(ctx context.Context, deps Deps, side string, level int, pri
 	return nil
 }
 
-// detectFillsAndFlip fetches the account's open orders, treats any of our
-// tracked orders that have vanished as filled (maker fills at limit price),
-// accounts the fill, and places the opposite order one level toward mid.
+// detectFillsAndFlip reconciles tracked orders against authoritative engine
+// state, accounts only the real filled delta, and places the opposite grid
+// order when a level's order actually fills. Partial fills that accrue while an
+// order still rests are accounted into inventory but do not flip until the
+// order leaves the book fully filled. Orders that leave the book without a fill
+// — self-trade-prevention cancels, or orders lost to an engine restart — are
+// resolved via /order/status and account nothing, so no phantom flips or PnL.
 func (g *grid) detectFillsAndFlip(ctx context.Context, deps Deps) error {
 	open, err := deps.Engine.OpenOrders(ctx, deps.Account)
 	if err != nil {
 		return err
 	}
-	stillOpen := map[string]bool{}
+	resting := map[string]string{} // id -> cumulative filled qty
 	for _, o := range open {
 		if o.Symbol == g.symbol && o.Market == string(g.market) {
-			stillOpen[o.ID] = true
+			resting[o.ID] = o.Filled
 		}
 	}
 	for id, ref := range g.state.OpenOrders {
-		if stillOpen[id] {
+		price := dec(ref.Price)
+		if filledStr, ok := resting[id]; ok {
+			// Still resting: account any accrued partial fill, keep the order.
+			r := ref
+			if g.state.applyFillDelta(&r, dec(filledStr), price).IsPositive() {
+				g.state.recordTrade(deps.MD.UpdatedAt)
+			}
+			g.state.OpenOrders[id] = r
 			continue
 		}
-		// Filled (or cancelled). We only cancel on stop, so absence while
-		// running means a fill at the limit price ref.Price.
-		qty := dec(ref.Qty)
-		price := dec(ref.Price)
-		if ref.Side == "BUY" {
-			g.state.applyBuyFill(qty, price)
+		// Left the book: resolve its true terminal state.
+		st, err := deps.Engine.OrderStatusByID(ctx, g.symbol, string(g.market), id)
+		if err != nil {
+			slog.Warn("grid order-status lookup failed", "symbol", g.symbol, "order", id, "error", err)
+			continue
+		}
+		if !st.Found {
+			continue // async-writer lag; reconcile on a later tick
+		}
+		r := ref
+		if g.state.applyFillDelta(&r, dec(st.Filled), price).IsPositive() {
 			g.state.recordTrade(deps.MD.UpdatedAt)
+		}
+		delete(g.state.OpenOrders, id)
+		// Flip only if the order actually took fills over its lifetime. A
+		// zero-filled exit (STP cancel or restart-orphaned) places nothing.
+		if !dec(st.Filled).IsPositive() {
+			continue
+		}
+		// The level's order filled: place the opposite order one level toward mid.
+		if ref.Side == "BUY" {
 			if ref.Level+1 <= g.grids {
 				_ = g.place(ctx, deps, "SELL", ref.Level+1, g.levels[ref.Level+1])
 			}
 		} else {
-			g.state.applySellFill(qty, price)
-			g.state.recordTrade(deps.MD.UpdatedAt)
 			if ref.Level-1 >= 0 {
 				_ = g.place(ctx, deps, "BUY", ref.Level-1, g.levels[ref.Level-1])
 			}
 		}
-		delete(g.state.OpenOrders, id)
 	}
 	return nil
 }
