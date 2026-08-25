@@ -143,7 +143,7 @@ func (g *grid) OnTick(ctx context.Context, deps Deps) error {
 
 func (g *grid) OnStop(ctx context.Context, deps Deps) error {
 	for id := range g.state.OpenOrders {
-		if _, err := deps.Engine.CancelOrder(ctx, g.symbol, string(g.market), id); err != nil {
+		if _, err := deps.Engine.CancelOrder(ctx, deps.Account, g.symbol, string(g.market), id); err != nil {
 			slog.Warn("grid stop cancel failed", "order", id, "error", err)
 		}
 	}

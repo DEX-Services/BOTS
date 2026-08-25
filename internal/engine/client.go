@@ -176,8 +176,9 @@ func (c *Client) SubmitOrder(ctx context.Context, account, symbol, market, side,
 }
 
 // CancelOrder cancels a resting order.
-func (c *Client) CancelOrder(ctx context.Context, symbol, market, orderID string) (OrderResponse, error) {
+func (c *Client) CancelOrder(ctx context.Context, account, symbol, market, orderID string) (OrderResponse, error) {
 	q := url.Values{}
+	q.Set("account", account)
 	q.Set("symbol", symbol)
 	q.Set("market", market)
 	q.Set("order_id", orderID)

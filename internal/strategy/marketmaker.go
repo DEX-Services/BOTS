@@ -275,7 +275,7 @@ func (m *marketMaker) place(ctx context.Context, deps Deps, side string, level i
 // possible fill.
 func (m *marketMaker) cancelAll(ctx context.Context, deps Deps) error {
 	for id, ref := range m.state.OpenOrders {
-		resp, err := deps.Engine.CancelOrder(ctx, m.symbol, string(m.market), id)
+		resp, err := deps.Engine.CancelOrder(ctx, deps.Account, m.symbol, string(m.market), id)
 		if err != nil {
 			slog.Warn("mm cancel failed", "order", id, "error", err)
 			continue
