@@ -6,8 +6,8 @@
 package engine
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,7 +42,7 @@ func NewClient(baseURL string, concurrency int) *Client {
 			Transport: &http.Transport{
 				MaxIdleConns:        512,
 				MaxIdleConnsPerHost: 256,
-				IdleConnTimeout:    90 * time.Second,
+				IdleConnTimeout:     90 * time.Second,
 			},
 		},
 		sem: make(chan struct{}, concurrency),
@@ -288,6 +288,9 @@ func (c *Client) getRaw(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if c.engineSecret != "" {
+		req.Header.Set("X-Engine-Secret", c.engineSecret)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return "", err
@@ -304,6 +307,9 @@ func (c *Client) getRaw(ctx context.Context, path string) (string, error) {
 }
 
 func (c *Client) do(req *http.Request, out any) error {
+	if c.engineSecret != "" {
+		req.Header.Set("X-Engine-Secret", c.engineSecret)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
