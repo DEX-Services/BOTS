@@ -82,7 +82,22 @@ func New(ctx context.Context, uri, prefix string, maxAge time.Duration) (*Reader
 // nowMs is the caller's current time in Unix milliseconds. It is passed in
 // rather than read here so the reader stays deterministic and testable.
 func (r *Reader) Get(ctx context.Context, asset string, nowMs int64) Snapshot {
-	key := r.key(asset)
+	return r.get(ctx, r.key(asset), nowMs)
+}
+
+// GetExact is like Get, but looks up "<prefix>:<ticker>" with the ticker's
+// casing preserved exactly as given — no upper-casing. Price-Fetcher writes
+// most tickers upper-case (BTC, EURUSD, GOLD) but Live-Rates.com stock
+// tickers are written with a case-sensitive suffix (AAPL.us, not AAPL.US —
+// see Price-Fetcher/README.md); Get's blanket ToUpper would silently miss
+// those keys. Callers that already have the exact ticker (e.g. the
+// /index/{base} HTTP handler, which takes it straight from the caller) use
+// this instead of Get, which is for parsed-out crypto pair bases.
+func (r *Reader) GetExact(ctx context.Context, ticker string, nowMs int64) Snapshot {
+	return r.get(ctx, fmt.Sprintf("%s:%s", r.prefix, ticker), nowMs)
+}
+
+func (r *Reader) get(ctx context.Context, key string, nowMs int64) Snapshot {
 	raw, err := r.rdb.Get(ctx, key).Bytes()
 	if err != nil {
 		// redis.Nil (key absent / expired via TTL) or any transport error.
@@ -111,7 +126,8 @@ func (r *Reader) Get(ctx context.Context, asset string, nowMs int64) Snapshot {
 // Close releases the Redis connection.
 func (r *Reader) Close() error { return r.rdb.Close() }
 
-// key builds "<prefix>:<BASE>" (upper-cased base), matching Price-Fetcher.
+// key builds "<prefix>:<BASE>" (upper-cased base), matching Price-Fetcher's
+// crypto/forex/commodity keys. NOT used for stock tickers — see GetExact.
 func (r *Reader) key(asset string) string {
 	return fmt.Sprintf("%s:%s", r.prefix, strings.ToUpper(asset))
 }

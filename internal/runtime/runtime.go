@@ -235,6 +235,23 @@ func (m *Manager) IndexSnapshot(ctx context.Context, symbol string) index.Snapsh
 	return m.indexSnapshot(ctx, symbol)
 }
 
+// IndexSnapshotExact looks up the index price for an EXACT asset ticker, with
+// no pair-parsing and no case normalization — unlike IndexSnapshot (via
+// baseAsset), which force-uppercases and is meant for crypto pairs like
+// "BTC-USDC" -> "BTC". That uppercasing silently breaks any ticker whose
+// real casing matters, e.g. price-fetcher's Live-Rates.com stock tickers are
+// stored as "price:AAPL.us" (lowercase suffix, by that upstream's own
+// case-sensitive contract — see Price-Fetcher/README.md) — a lookup for
+// "AAPL.US" simply misses. Used by the /index/{base} HTTP handler, which
+// takes a caller-supplied ticker that's already the exact key to look up,
+// not a pair needing parsing.
+func (m *Manager) IndexSnapshotExact(ctx context.Context, ticker string) index.Snapshot {
+	if m.index == nil {
+		return index.Snapshot{}
+	}
+	return m.index.GetExact(ctx, ticker, time.Now().UnixMilli())
+}
+
 // baseAsset extracts the base symbol from a pair like "BTC-USDC" -> "BTC".
 func baseAsset(symbol string) string {
 	s := strings.ToUpper(strings.TrimSpace(symbol))

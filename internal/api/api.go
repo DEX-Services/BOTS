@@ -115,12 +115,19 @@ func (s *Server) handleMarketplace(w http.ResponseWriter, r *http.Request) {
 // This is the same snapshot the MM quotes and marks P/L against, exposed so the
 // frontend header stays consistent with the desk and the engine's mark price.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	base := strings.ToUpper(strings.TrimSpace(r.PathValue("base")))
+	// NOT upper-cased: this ticker is used verbatim as the Redis key
+	// suffix (via IndexSnapshotExact). Most tickers price-fetcher writes
+	// ARE upper-case (BTC, EURUSD, GOLD), so callers sending those still
+	// work identically to before — but Live-Rates.com stock tickers are
+	// stored with a case-sensitive suffix ("AAPL.us"), and forcing upper
+	// case here used to make every stock lookup silently miss
+	// ("price:AAPL.US" was never a real key).
+	base := strings.TrimSpace(r.PathValue("base"))
 	if base == "" {
 		writeErr(w, http.StatusBadRequest, "base required")
 		return
 	}
-	snap := s.manager.IndexSnapshot(r.Context(), base)
+	snap := s.manager.IndexSnapshotExact(r.Context(), base)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"base":          base,
 		"price":         snap.Price.String(),
