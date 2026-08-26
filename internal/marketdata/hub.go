@@ -103,8 +103,8 @@ func (h *Hub) Unsubscribe(symbol, market string, ch chan struct{}) {
 	k := key(symbol, market)
 	h.mu.Lock()
 	f := h.feeds[k]
-	h.mu.Unlock()
 	if f == nil {
+		h.mu.Unlock()
 		return
 	}
 	f.subMu.Lock()
@@ -112,8 +112,13 @@ func (h *Hub) Unsubscribe(symbol, market string, ch chan struct{}) {
 	empty := len(f.subs) == 0
 	f.subMu.Unlock()
 	if empty {
-		f.stop <- struct{}{}
+		// Remove the stopped feed from the registry. Leaving it in place meant
+		// its sync.Once prevented a later manual bot restart from starting a
+		// new poller, so the restarted bot never received another tick.
+		delete(h.feeds, k)
+		close(f.stop)
 	}
+	h.mu.Unlock()
 }
 
 func (f *feed) run(symbol, market string) {

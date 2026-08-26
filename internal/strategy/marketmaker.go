@@ -147,8 +147,13 @@ func decConfig(bot *models.Bot, key string) decimal.Decimal {
 }
 
 func (m *marketMaker) Init(ctx context.Context, deps Deps) error {
-	// Nothing to seed up front — the first OnTick with a fresh index quotes the
-	// ladder. Init just marks the strategy ready.
+	// A stopped bot may have persisted order IDs after its orders were already
+	// cancelled (or may have live quotes left by an interrupted shutdown). Do
+	// not trust that snapshot on a manual restart: reconcile against the engine
+	// and begin with a known-empty ladder.
+	if err := m.cancelWalletQuotes(ctx, deps); err != nil {
+		return err
+	}
 	m.state.InitDone = true
 	return nil
 }
@@ -179,7 +184,7 @@ func (m *marketMaker) OnTick(ctx context.Context, deps Deps) error {
 }
 
 func (m *marketMaker) OnStop(ctx context.Context, deps Deps) error {
-	return m.cancelAll(ctx, deps)
+	return m.cancelWalletQuotes(ctx, deps)
 }
 
 func (m *marketMaker) Snapshot() State { return *m.state }
@@ -288,6 +293,31 @@ func (m *marketMaker) cancelAll(ctx context.Context, deps Deps) error {
 		}
 		delete(m.state.OpenOrders, id)
 	}
+	return nil
+}
+
+// cancelWalletQuotes cancels every live quote for this MM account and symbol,
+// rather than relying solely on the persisted OpenOrders map. This makes a
+// manual stop/start safe even if the process stopped between an engine change
+// and the next state persistence.
+func (m *marketMaker) cancelWalletQuotes(ctx context.Context, deps Deps) error {
+	open, err := deps.Engine.OpenOrders(ctx, deps.Account)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, o := range open {
+		if o.Symbol != m.symbol || o.Market != string(m.market) {
+			continue
+		}
+		if _, err := deps.Engine.CancelOrder(ctx, deps.Account, m.symbol, string(m.market), o.ID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	m.state.OpenOrders = map[string]OrderRef{}
 	return nil
 }
 

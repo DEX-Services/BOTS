@@ -7,6 +7,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -29,9 +30,9 @@ const maxConsecutiveErrors = 10
 
 // Manager owns all running bot workers.
 type Manager struct {
-	engine  *engine.Client
-	hub     *marketdata.Hub
-	store   *store.Store
+	engine *engine.Client
+	hub    *marketdata.Hub
+	store  *store.Store
 	// index reads the shared index price for market-maker bots. May be nil
 	// when no Redis is configured; strategies that need it get a zero snapshot.
 	index   *index.Reader
@@ -109,14 +110,27 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 		}
 		strat.Restore(st)
 	}
+	wakeCh := m.hub.Subscribe(bot.Symbol, string(bot.Market))
+	deps := strategy.Deps{
+		Engine: m.engine, Account: bot.WalletAddress, Bot: bot,
+		MD:    m.hub.Snapshot(bot.Symbol, string(bot.Market)),
+		Index: m.indexSnapshot(ctx, bot.Symbol),
+	}
+	// Strategies may reconcile external state before they begin ticking. In
+	// particular, a market maker clears stale persisted order IDs here so a
+	// manual stop/start always resumes with a clean ladder.
+	if err := strat.Init(ctx, deps); err != nil {
+		m.hub.Unsubscribe(bot.Symbol, string(bot.Market), wakeCh)
+		return fmt.Errorf("initialize bot: %w", err)
+	}
 	if err := m.store.MarkRunning(ctx, botID); err != nil {
+		m.hub.Unsubscribe(bot.Symbol, string(bot.Market), wakeCh)
 		return err
 	}
 	bot.Status = models.StatusRunning
-
 	w := &worker{
 		manager: m, bot: bot, strategy: strat,
-		wakeCh: m.hub.Subscribe(bot.Symbol, string(bot.Market)),
+		wakeCh: wakeCh,
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 		startedAt: time.Now(),
 	}
