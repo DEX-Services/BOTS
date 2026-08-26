@@ -101,6 +101,37 @@ func (c *Client) ReleaseLocks(ctx context.Context, userID, asset string) error {
 	return nil
 }
 
+// SyncBalance restores an internal desk wallet's durable balance to its
+// authoritative allocation after a matching-engine restart. The amount is a
+// human-unit decimal and is converted to the backend's fixed-point units.
+func (c *Client) SyncBalance(ctx context.Context, userID, asset string, amount decimal.Decimal) error {
+	if c.engineSecret == "" {
+		return fmt.Errorf("engine secret not configured; cannot synchronize backend balance")
+	}
+	body, err := json.Marshal(map[string]string{
+		"userId": userID, "asset": asset, "amount": toRawUnits(amount),
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/balance/sync", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Engine-Secret", c.engineSecret)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("backend sync balance %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
 // EnsureUser creates a synthetic Dex-Backend users row for the MM desk wallet
 // via /internal/user/ensure, so its user_balances credits/locks satisfy the
 // foreign key to users. Idempotent. Must be called before the first Deposit.

@@ -217,8 +217,10 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 				m.place(ctx, deps, "BUY", i, bidPrice, qty)
 			}
 		}
-		// SELL side. Spot can only sell what it holds; futures may short.
-		canSell := m.market == models.Futures || held.IsPositive()
+		// SELL side. Spot desks are provisioned with base inventory by the
+		// market-maker service; the engine remains the authoritative guard and
+		// rejects an ask if that inventory is unavailable.
+		canSell := m.market == models.Futures || held.IsPositive() || m.market == models.Spot
 		if canSell && (m.maxInventory.IsZero() || held.GreaterThan(m.maxInventory.Neg())) {
 			if qty := m.snapQty(qtyFor(perLevel, askPrice)); qty.IsPositive() {
 				m.place(ctx, deps, "SELL", i, askPrice, qty)

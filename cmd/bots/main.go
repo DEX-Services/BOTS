@@ -76,30 +76,15 @@ func main() {
 
 	manager := runtime.NewManager(engineClient, hub, st, idx)
 
-	// Market-maker funding service. Recredit restores each desk's engine-ledger
-	// balance from the DB (the ledger is in-memory and wiped on engine restart)
-	// before any bot resumes quoting.
+	// Market-maker restart recovery runs before the matching engine starts (see
+	// run.sh). It restores durable desk balances; the engine's subsequent
+	// startup backfill creates its in-memory mirror exactly once.
 	mmSvc := mm.NewService(st, engineClient, backendClient, manager)
-	// The engine may still be booting when bots starts (its in-memory ledger
-	// isn't ready to accept credits yet), so retry in the background instead of
-	// giving up after one connection-refused. Runs off the request path so the
-	// API still comes up immediately.
-	go func() {
-		for attempt := 1; attempt <= 30; attempt++ {
-			if err := mmSvc.Recredit(ctx); err != nil {
-				slog.Warn("market-maker ledger recredit failed; retrying", "attempt", attempt, "error", err)
-				select {
-				case <-time.After(2 * time.Second):
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
-			slog.Info("market-maker ledger recredited", "attempt", attempt)
-			return
-		}
-		slog.Error("market-maker ledger recredit gave up; desks will under-quote until re-funded")
-	}()
+	if err := mmSvc.Recredit(ctx); err != nil {
+		slog.Error("market-maker recovery failed", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("market-maker balances recovered")
 
 	verifier := auth.NewVerifier(cfg.JWTSecret)
 	server := api.NewServer(st, manager, verifier, mmSvc)
