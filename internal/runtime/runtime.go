@@ -316,8 +316,9 @@ func (w *worker) tick(ctx context.Context) (halt bool) {
 
 func (w *worker) persist(ctx context.Context) {
 	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
+	idx := w.manager.indexSnapshot(ctx, w.bot.Symbol)
 	state := w.strategy.Snapshot()
-	stats := computeStats(state, md, w.bot, w.startedAt, time.Now())
+	stats := computeStats(state, md, idx, w.bot, w.startedAt, time.Now())
 	if err := w.manager.store.SaveState(ctx, w.bot.ID, state, stats); err != nil {
 		slog.Warn("bot persist failed", "id", w.bot.ID, "error", err)
 	}
@@ -336,11 +337,24 @@ func (w *worker) shutdown(ctx context.Context) {
 }
 
 // computeStats derives the UI/marketplace metrics from strategy state + price.
-func computeStats(s strategy.State, md marketdata.Snapshot, bot *models.Bot, startedAt, now time.Time) models.Stats {
+//
+// Unrealized P/L is marked against the external index price, not the engine's
+// own order-book mid: right after an engine restart (or any moment the book
+// is missing a best bid or ask) Ticker returns Mid=0, and marking held
+// inventory against a zero price manufactures a phantom ~100% loss even
+// though nothing was actually sold. The strategy already treats the index as
+// the authoritative reference for quoting (see marketMaker's doc comment);
+// stats need the same reference to stay consistent with reality. The book
+// mid remains the fallback for strategies/symbols with no index feed.
+func computeStats(s strategy.State, md marketdata.Snapshot, idx index.Snapshot, bot *models.Bot, startedAt, now time.Time) models.Stats {
 	realized := dec(s.RealizedPnL)
 	held := dec(s.BaseHeld)
 	avg := dec(s.AvgEntry)
-	unrealized := held.Mul(md.Mid.Sub(avg))
+	mark := md.Mid
+	if idx.Fresh && idx.Price.IsPositive() {
+		mark = idx.Price
+	}
+	unrealized := held.Mul(mark.Sub(avg))
 	net := realized.Add(unrealized)
 	roi := decimal.Zero
 	if inv := dec(bot.Investment); inv.IsPositive() {

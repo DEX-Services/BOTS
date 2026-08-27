@@ -228,6 +228,23 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 	// Per-level quote notional: split the budget evenly across all levels/side.
 	perLevel := m.investment.Div(decimal.NewFromInt(int64(m.levels)))
 	tenK := decimal.NewFromInt(10000)
+	numLevels := decimal.NewFromInt(int64(m.levels))
+
+	// SELL side sizing must be capped by actual held base inventory, not
+	// re-derived from the quote-denominated investment budget. Sizing each
+	// level independently as investment/levels/askPrice silently assumes
+	// askPrice ≈ the index price at the moment the desk was funded; once the
+	// index has moved (spot desks are funded once, at recredit, off a single
+	// snapshot price) that assumption drifts and the ladder's total ask
+	// quantity can exceed what's actually in the wallet, which the engine
+	// then rejects wholesale (ReplaceMarketMakerLadder is all-or-nothing) on
+	// every single tick until the price recovers. Splitting the held balance
+	// itself evenly across levels keeps the ladder inside the wallet no
+	// matter how far the index has moved since funding.
+	sellPerLevel := decimal.Zero
+	if m.market == models.Spot && held.IsPositive() {
+		sellPerLevel = held.Div(numLevels)
+	}
 
 	quotes := make([]engine.MarketMakerQuote, 0, m.levels*2)
 	for i := 0; i < m.levels; i++ {
@@ -242,12 +259,18 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 				quotes = append(quotes, engine.MarketMakerQuote{Side: "BUY", Price: bidPrice.String(), Qty: qty.String()})
 			}
 		}
-		// SELL side. Spot desks are provisioned with base inventory by the
-		// market-maker service; the engine remains the authoritative guard and
-		// rejects an ask if that inventory is unavailable.
-		canSell := m.market == models.Futures || held.IsPositive() || m.market == models.Spot
+		// SELL side. Futures desks have no base inventory to run out of (the
+		// engine margins the position instead), so they keep sizing off the
+		// quote budget. Spot desks size off actual held base, capped above.
+		canSell := m.market == models.Futures || held.IsPositive()
 		if canSell && (m.maxInventory.IsZero() || held.GreaterThan(m.maxInventory.Neg())) {
-			if qty := m.snapQty(qtyFor(perLevel, askPrice)); qty.IsPositive() {
+			var askQty decimal.Decimal
+			if m.market == models.Spot {
+				askQty = sellPerLevel
+			} else {
+				askQty = qtyFor(perLevel, askPrice)
+			}
+			if qty := m.snapQty(askQty); qty.IsPositive() {
 				quotes = append(quotes, engine.MarketMakerQuote{Side: "SELL", Price: askPrice.String(), Qty: qty.String()})
 			}
 		}

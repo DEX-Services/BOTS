@@ -392,6 +392,18 @@ func (s *Service) Recredit(ctx context.Context) error {
 			if err := s.backend.SyncBalance(ctx, desks[i].WalletAddress, desks[i].Base, baseCapital); err != nil {
 				return fmt.Errorf("sync base inventory for %s: %w", desks[i].ID, err)
 			}
+			// The engine's in-memory ledger is restart-wiped and only refilled once,
+			// from Postgres, by its own startup backfill — which races this Recredit
+			// (the engine typically boots and backfills before Recredit finishes, so
+			// it captures the pre-recredit balance). Left unsynced, the engine keeps
+			// quoting the strategy's next Init() off that stale figure while the
+			// backend's real balance is the fresh one Recredit just wrote, so the
+			// very first requote's lock request mismatches and every subsequent one
+			// fails "insufficient BTC balance to lock" forever. Push the same target
+			// into the engine ledger so both sides agree again.
+			if err := s.syncEngineLedger(ctx, desks[i].WalletAddress, desks[i].Base, baseCapital); err != nil {
+				return fmt.Errorf("sync engine ledger for %s: %w", desks[i].ID, err)
+			}
 			// Recredit deliberately resets the desk to a new 50/50 USDT/BTC
 			// inventory baseline. Seed the strategy's cost basis with that BTC at
 			// the same index price; otherwise its first sell treats provisioned BTC
@@ -417,6 +429,30 @@ func (s *Service) Recredit(ctx context.Context) error {
 		if err := s.backend.SyncBalance(ctx, desks[i].WalletAddress, asset, quoteCapital); err != nil {
 			return fmt.Errorf("sync backend balance for %s: %w", desks[i].ID, err)
 		}
+		if err := s.syncEngineLedger(ctx, desks[i].WalletAddress, asset, quoteCapital); err != nil {
+			return fmt.Errorf("sync engine ledger for %s: %w", desks[i].ID, err)
+		}
 	}
 	return nil
+}
+
+// syncEngineLedger brings the engine's in-memory ledger balance for
+// (account, asset) to exactly target, mirroring what SyncBalanceFor just set
+// in the backend's Postgres row. The engine only exposes credit/debit deltas
+// (see /internal/ledger/sync), not an absolute set, so the delta is computed
+// against whatever the engine currently holds — which may itself be stale
+// after a restart (see the caller's comment).
+func (s *Service) syncEngineLedger(ctx context.Context, account, asset string, target decimal.Decimal) error {
+	current, err := s.engine.Balance(ctx, account, asset)
+	if err != nil {
+		return fmt.Errorf("read engine balance: %w", err)
+	}
+	delta := target.Sub(current.Balance)
+	if delta.IsZero() {
+		return nil
+	}
+	if delta.IsPositive() {
+		return s.engine.LedgerSync(ctx, account, asset, delta.String(), "credit")
+	}
+	return s.engine.LedgerSync(ctx, account, asset, delta.Neg().String(), "debit")
 }

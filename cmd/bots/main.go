@@ -91,13 +91,30 @@ func main() {
 	// Market-maker restart recovery runs before the matching engine starts (see
 	// run.sh). It restores durable desk balances; the engine's subsequent
 	// startup backfill creates its in-memory mirror exactly once.
+	//
+	// The index reader connecting (above) only means Redis is reachable, not
+	// that a fresh price tick has landed yet — Recredit needs the latter for
+	// spot desks and fails immediately after a cold start. StartAll below
+	// unconditionally resumes any bot that was running before the restart,
+	// without going through the SetEnabled path that would otherwise retry
+	// Recredit, so a desk resumed here can be left quoting against its old
+	// pre-restart BaseHeld while the backend's real BTC balance was never
+	// re-synced — every requote then fails "insufficient BTC balance to lock"
+	// forever. Retry with a short backoff so a slow-to-warm index doesn't
+	// strand a desk in that state; only fall through with a warning (rather
+	// than block startup indefinitely) if the feed genuinely never comes up.
 	mmSvc := mm.NewService(st, engineClient, backendClient, manager)
-	if err := mmSvc.Recredit(ctx); err != nil {
-		// Recovery is retried when a desk is started. Keep the API available so
-		// one transient Redis/index outage cannot make every bot unusable.
-		slog.Warn("market-maker recovery deferred", "error", err)
+	recreditErr := mmSvc.Recredit(ctx)
+	for attempt := 0; recreditErr != nil && attempt < 5; attempt++ {
+		slog.Warn("market-maker recredit failed, retrying", "attempt", attempt+1, "error", recreditErr)
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+		recreditErr = mmSvc.Recredit(ctx)
 	}
-	slog.Info("market-maker balances recovered")
+	if recreditErr != nil {
+		slog.Warn("market-maker recovery deferred; resumed spot desks may quote against stale balances until manually restarted", "error", recreditErr)
+	} else {
+		slog.Info("market-maker balances recovered")
+	}
 
 	verifier := auth.NewVerifier(cfg.JWTSecret)
 	server := api.NewServer(st, manager, verifier, mmSvc)
