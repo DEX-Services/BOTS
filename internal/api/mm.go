@@ -25,11 +25,14 @@ func adminID(r *http.Request) string {
 // so the admin dashboard can render funding + realtime P/L in one payload.
 type mmDeskView struct {
 	models.MarketMaker
-	IsRunning  bool              `json:"isRunning"`
-	IndexPrice string            `json:"indexPrice"`
-	IndexFresh bool              `json:"indexFresh"`
-	Config     map[string]string `json:"config"`
-	Stats      models.Stats      `json:"stats"`
+	IsRunning    bool              `json:"isRunning"`
+	IndexPrice   string            `json:"indexPrice"`
+	IndexFresh   bool              `json:"indexFresh"`
+	Config       map[string]string `json:"config"`
+	Stats        models.Stats      `json:"stats"`
+	QuoteAsset   string            `json:"quoteAsset"`
+	QuoteBalance string            `json:"quoteBalance"`
+	BaseBalance  string            `json:"baseBalance"`
 }
 
 func (s *Server) deskView(r *http.Request, desk *models.MarketMaker) mmDeskView {
@@ -42,6 +45,20 @@ func (s *Server) deskView(r *http.Request, desk *models.MarketMaker) mmDeskView 
 	v.IndexFresh = idx.Fresh
 	if idx.Price.IsPositive() {
 		v.IndexPrice = idx.Price.String()
+	}
+	// Spot capital is deliberately split 50/50: quote liquidity backs bids and
+	// base inventory backs asks. Expose both values so the admin can verify the
+	// two-sided inventory directly from the desk card.
+	alloc, err := decimal.NewFromString(desk.AllocatedUSDC)
+	if err == nil && alloc.IsPositive() {
+		if desk.Market == models.Spot && idx.Price.IsPositive() {
+			v.QuoteAsset = "USDT"
+			v.QuoteBalance = alloc.Div(decimal.NewFromInt(2)).String()
+			v.BaseBalance = alloc.Div(decimal.NewFromInt(2)).Div(idx.Price).String()
+		} else {
+			v.QuoteAsset = "USDC"
+			v.QuoteBalance = alloc.String()
+		}
 	}
 	return v
 }

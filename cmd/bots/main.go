@@ -63,8 +63,20 @@ func main() {
 	// quote, but every other strategy runs unaffected.
 	var idx *index.Reader
 	if cfg.RedisURI != "" {
-		idx, err = index.New(ctx, cfg.RedisURI, cfg.IndexPrefix, time.Duration(cfg.IndexMaxAgeMs)*time.Millisecond)
-		if err != nil {
+		// Aiven Redis can take a few seconds to accept a connection just after
+		// a local stack restart. Retry before declaring MM market data absent;
+		// otherwise the recovery path used to abort the entire bots service.
+		for attempt := 1; attempt <= 3; attempt++ {
+			idx, err = index.New(ctx, cfg.RedisURI, cfg.IndexPrefix, time.Duration(cfg.IndexMaxAgeMs)*time.Millisecond)
+			if err == nil {
+				break
+			}
+			slog.Warn("index price reader connect failed", "attempt", attempt, "error", err)
+			if attempt < 3 {
+				time.Sleep(2 * time.Second)
+			}
+		}
+		if err != nil || idx == nil {
 			slog.Warn("index price reader unavailable; market-maker bots will not quote", "error", err)
 			idx = nil
 		} else {
@@ -81,8 +93,9 @@ func main() {
 	// startup backfill creates its in-memory mirror exactly once.
 	mmSvc := mm.NewService(st, engineClient, backendClient, manager)
 	if err := mmSvc.Recredit(ctx); err != nil {
-		slog.Error("market-maker recovery failed", "error", err)
-		os.Exit(1)
+		// Recovery is retried when a desk is started. Keep the API available so
+		// one transient Redis/index outage cannot make every bot unusable.
+		slog.Warn("market-maker recovery deferred", "error", err)
 	}
 	slog.Info("market-maker balances recovered")
 

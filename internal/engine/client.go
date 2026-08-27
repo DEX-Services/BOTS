@@ -109,6 +109,17 @@ type OrderResponse struct {
 	Trades  int    `json:"trades"`
 }
 
+type MarketMakerQuote struct {
+	Side  string `json:"side"`
+	Price string `json:"price"`
+	Qty   string `json:"qty"`
+}
+
+type MarketMakerReplaceResponse struct {
+	Status string      `json:"status"`
+	Orders []OpenOrder `json:"orders"`
+}
+
 // OpenOrder is one entry from /orders.
 type OpenOrder struct {
 	ID     string `json:"id"`
@@ -173,6 +184,31 @@ func (c *Client) SubmitOrder(ctx context.Context, account, symbol, market, side,
 		return OrderResponse{}, err
 	}
 	return out, nil
+}
+
+// ReplaceMarketMakerLadder atomically replaces an MM account's complete
+// passive ladder. All orders become visible together on the engine side.
+func (c *Client) ReplaceMarketMakerLadder(ctx context.Context, account, symbol, market string, reference decimal.Decimal, referenceTimestampMs int64, quotes []MarketMakerQuote) (MarketMakerReplaceResponse, error) {
+	body, err := json.Marshal(map[string]any{
+		"account": account, "symbol": symbol, "market": market,
+		"referencePrice": reference.String(), "referenceTimestampMs": referenceTimestampMs,
+		"orders": quotes,
+	})
+	if err != nil {
+		return MarketMakerReplaceResponse{}, err
+	}
+	var out MarketMakerReplaceResponse
+	if err := c.post(ctx, "/market-maker/replace", bytes.NewReader(body), &out); err != nil {
+		return MarketMakerReplaceResponse{}, err
+	}
+	return out, nil
+}
+
+// ClearMarketMakerLadder removes all live quotes for the dedicated MM account
+// in one engine command and releases its aggregate reservation.
+func (c *Client) ClearMarketMakerLadder(ctx context.Context, account, symbol, market string) error {
+	_, err := c.ReplaceMarketMakerLadder(ctx, account, symbol, market, decimal.Zero, time.Now().UnixMilli(), nil)
+	return err
 }
 
 // CancelOrder cancels a resting order.

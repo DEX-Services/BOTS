@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dex/bots/internal/engine"
 	"github.com/dex/bots/internal/models"
 	"github.com/shopspring/decimal"
 )
@@ -41,8 +42,9 @@ type marketMaker struct {
 	marginMode   string
 	// requoteBps is how far (in bps) the index must move from the last quote
 	// mid before we cancel + re-quote. Prevents churning on every micro-tick.
-	requoteBps decimal.Decimal
-	lastMid    decimal.Decimal
+	requoteBps           decimal.Decimal
+	lastMid              decimal.Decimal
+	lastIndexTimestampMs int64
 	// tick/lot are the engine's price/qty granularity for this symbol. Quotes are
 	// snapped to them before submission — the engine rejects orders that aren't a
 	// multiple of tick size / lot size. Seeded into config by the MM service at
@@ -172,10 +174,11 @@ func (m *marketMaker) OnTick(ctx context.Context, deps Deps) error {
 		slog.Warn("mm fill-detect failed", "symbol", m.symbol, "error", err)
 	}
 
-	// 3. Re-quote only when the index has drifted beyond the threshold (or we
-	//    have no quotes yet).
-	if len(m.state.OpenOrders) == 0 || m.drifted(mid) {
-		if err := m.requote(ctx, deps, mid); err != nil {
+	// 3. Every fresh external publication is a complete new quote set.  This
+	// deliberately does not use the engine midpoint or a drift threshold: the
+	// price-fetcher timestamp is the authoritative cadence.
+	if len(m.state.OpenOrders) == 0 || (idx.TimestampMs > 0 && idx.TimestampMs != m.lastIndexTimestampMs) {
+		if err := m.requote(ctx, deps, mid, idx.TimestampMs); err != nil {
 			slog.Warn("mm requote failed", "symbol", m.symbol, "error", err)
 		}
 	}
@@ -201,15 +204,13 @@ func (m *marketMaker) drifted(mid decimal.Decimal) bool {
 }
 
 // requote cancels all resting quotes and places a fresh ladder around mid.
-func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decimal) error {
-	if err := m.cancelAll(ctx, deps); err != nil {
-		return err
-	}
+func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decimal, timestampMs int64) error {
 	held := dec(m.state.BaseHeld)
 	// Per-level quote notional: split the budget evenly across all levels/side.
 	perLevel := m.investment.Div(decimal.NewFromInt(int64(m.levels)))
 	tenK := decimal.NewFromInt(10000)
 
+	quotes := make([]engine.MarketMakerQuote, 0, m.levels*2)
 	for i := 0; i < m.levels; i++ {
 		offBps := m.spreadBps.Add(m.levelStepBps.Mul(decimal.NewFromInt(int64(i))))
 		off := offBps.Div(tenK)
@@ -219,7 +220,7 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 		// BUY side — skip if inventory is already at/over the cap.
 		if m.maxInventory.IsZero() || held.LessThan(m.maxInventory) {
 			if qty := m.snapQty(qtyFor(perLevel, bidPrice)); qty.IsPositive() {
-				m.place(ctx, deps, "BUY", i, bidPrice, qty)
+				quotes = append(quotes, engine.MarketMakerQuote{Side: "BUY", Price: bidPrice.String(), Qty: qty.String()})
 			}
 		}
 		// SELL side. Spot desks are provisioned with base inventory by the
@@ -228,11 +229,26 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 		canSell := m.market == models.Futures || held.IsPositive() || m.market == models.Spot
 		if canSell && (m.maxInventory.IsZero() || held.GreaterThan(m.maxInventory.Neg())) {
 			if qty := m.snapQty(qtyFor(perLevel, askPrice)); qty.IsPositive() {
-				m.place(ctx, deps, "SELL", i, askPrice, qty)
+				quotes = append(quotes, engine.MarketMakerQuote{Side: "SELL", Price: askPrice.String(), Qty: qty.String()})
 			}
 		}
 	}
+	if len(quotes) != m.levels*2 {
+		return fmt.Errorf("cannot form complete two-sided ladder: got %d quotes", len(quotes))
+	}
+	if timestampMs == 0 {
+		timestampMs = time.Now().UnixMilli()
+	}
+	resp, err := deps.Engine.ReplaceMarketMakerLadder(ctx, deps.Account, m.symbol, string(m.market), mid, timestampMs, quotes)
+	if err != nil {
+		return err
+	}
+	m.state.OpenOrders = make(map[string]OrderRef, len(resp.Orders))
+	for _, o := range resp.Orders {
+		m.state.OpenOrders[o.ID] = OrderRef{OrderID: o.ID, Side: o.Side, Price: o.Price, Qty: o.Qty, Level: -1, Kind: "mm"}
+	}
 	m.lastMid = mid
+	m.lastIndexTimestampMs = timestampMs
 	return nil
 }
 
@@ -281,18 +297,10 @@ func (m *marketMaker) place(ctx context.Context, deps Deps, side string, level i
 // detectFills reconciles it against authoritative state instead of dropping a
 // possible fill.
 func (m *marketMaker) cancelAll(ctx context.Context, deps Deps) error {
-	for id, ref := range m.state.OpenOrders {
-		resp, err := deps.Engine.CancelOrder(ctx, deps.Account, m.symbol, string(m.market), id)
-		if err != nil {
-			slog.Warn("mm cancel failed", "order", id, "error", err)
-			continue
-		}
-		r := ref
-		if m.state.applyFillDelta(&r, dec(resp.Filled), dec(r.Price)).IsPositive() {
-			m.state.recordTrade(deps.MD.UpdatedAt)
-		}
-		delete(m.state.OpenOrders, id)
+	if err := deps.Engine.ClearMarketMakerLadder(ctx, deps.Account, m.symbol, string(m.market)); err != nil {
+		return err
 	}
+	m.state.OpenOrders = map[string]OrderRef{}
 	return nil
 }
 
@@ -301,24 +309,7 @@ func (m *marketMaker) cancelAll(ctx context.Context, deps Deps) error {
 // manual stop/start safe even if the process stopped between an engine change
 // and the next state persistence.
 func (m *marketMaker) cancelWalletQuotes(ctx context.Context, deps Deps) error {
-	open, err := deps.Engine.OpenOrders(ctx, deps.Account)
-	if err != nil {
-		return err
-	}
-	var firstErr error
-	for _, o := range open {
-		if o.Symbol != m.symbol || o.Market != string(m.market) {
-			continue
-		}
-		if _, err := deps.Engine.CancelOrder(ctx, deps.Account, m.symbol, string(m.market), o.ID); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	m.state.OpenOrders = map[string]OrderRef{}
-	return nil
+	return m.cancelAll(ctx, deps)
 }
 
 // detectFills reconciles tracked quotes against the engine's authoritative

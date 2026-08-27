@@ -242,6 +242,12 @@ func (s *Service) SetEnabled(ctx context.Context, deskID string, enabled bool) e
 		return err
 	}
 	if enabled {
+		// A desk may be enabled after funding without a process restart. Reconcile
+		// its durable quote/base inventory first so Spot has the 50/50 USDT/BTC
+		// split required for a two-sided book.
+		if err := s.Recredit(ctx); err != nil {
+			return fmt.Errorf("reconcile desk balances: %w", err)
+		}
 		if err := s.manager.Start(ctx, desk.BotID); err != nil {
 			return err
 		}

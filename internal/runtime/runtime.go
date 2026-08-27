@@ -199,6 +199,11 @@ func (w *worker) run() {
 	defer close(w.doneCh)
 	persist := time.NewTicker(persistInterval)
 	defer persist.Stop()
+	// The external index is updated independently from the engine's trade
+	// stream. A one-second wake guarantees market makers react to each fresh
+	// Price-Fetcher publication even while their own book has no trades.
+	indexTick := time.NewTicker(time.Second)
+	defer indexTick.Stop()
 	ctx := context.Background()
 	for {
 		select {
@@ -210,6 +215,14 @@ func (w *worker) run() {
 				w.shutdown(ctx)
 				go w.manager.remove(w) // detach off the worker goroutine; Stop would deadlock here
 				return
+			}
+		case <-indexTick.C:
+			if w.bot.Strategy == "market_maker" {
+				if halted := w.tick(ctx); halted {
+					w.shutdown(ctx)
+					go w.manager.remove(w)
+					return
+				}
 			}
 		case <-persist.C:
 			w.persist(ctx)

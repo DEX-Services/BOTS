@@ -37,9 +37,10 @@ type payload struct {
 // AgeMs are what quoting and P/L rely on; the 24h stats are display-only and
 // carry the source's last values regardless of freshness.
 type Snapshot struct {
-	Price decimal.Decimal
-	Fresh bool  // false when the key is missing or older than maxAge
-	AgeMs int64 // age of the price in milliseconds (0 when unknown)
+	Price       decimal.Decimal
+	Fresh       bool  // false when the key is missing or older than maxAge
+	AgeMs       int64 // age of the price in milliseconds (0 when unknown)
+	TimestampMs int64 // source publication time; used to deduplicate MM refreshes
 
 	ChangePercent float64 // 24h change %
 	High24h       float64 // 24h high
@@ -117,7 +118,7 @@ func (r *Reader) get(ctx context.Context, key string, nowMs int64) Snapshot {
 	}
 	fresh := age <= r.maxAge.Milliseconds()
 	return Snapshot{
-		Price: price, Fresh: fresh, AgeMs: age,
+		Price: price, Fresh: fresh, AgeMs: age, TimestampMs: p.TimestampMs,
 		ChangePercent: p.ChangePercent, High24h: p.High24h,
 		Low24h: p.Low24h, QuoteVolume: p.QuoteVolume,
 	}
