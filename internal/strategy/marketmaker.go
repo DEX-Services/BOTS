@@ -156,6 +156,25 @@ func (m *marketMaker) Init(ctx context.Context, deps Deps) error {
 	if err := m.cancelWalletQuotes(ctx, deps); err != nil {
 		return err
 	}
+	// A spot desk's base inventory is funded outside the order stream. Never
+	// trust a persisted pre-restart cost basis for it: it can belong to a prior
+	// funding cycle and turn the desk's entire inventory value into a phantom
+	// P/L. Rebuild the baseline from the authoritative engine balance and the
+	// fresh external index before any new quotes are allowed.
+	if m.market == models.Spot && deps.Index.Fresh && deps.Index.Price.IsPositive() {
+		balance, err := deps.Engine.Balance(ctx, deps.Account, m.base)
+		if err != nil {
+			return fmt.Errorf("read spot inventory baseline: %w", err)
+		}
+		held := balance.Balance
+		m.state.BaseHeld = held.String()
+		m.state.QuoteCost = held.Mul(deps.Index.Price).String()
+		m.state.AvgEntry = deps.Index.Price.String()
+		m.state.RealizedPnL = "0"
+		m.state.MatchedTrades = 0
+		m.state.TradeTimes = nil
+		m.state.Equity = nil
+	}
 	m.state.InitDone = true
 	return nil
 }

@@ -392,6 +392,20 @@ func (s *Service) Recredit(ctx context.Context) error {
 			if err := s.backend.SyncBalance(ctx, desks[i].WalletAddress, desks[i].Base, baseCapital); err != nil {
 				return fmt.Errorf("sync base inventory for %s: %w", desks[i].ID, err)
 			}
+			// Recredit deliberately resets the desk to a new 50/50 USDT/BTC
+			// inventory baseline. Seed the strategy's cost basis with that BTC at
+			// the same index price; otherwise its first sell treats provisioned BTC
+			// as free inventory and reports the entire sale value as "profit".
+			state := strategy.State{
+				OpenOrders:  map[string]strategy.OrderRef{},
+				BaseHeld:    baseCapital.String(),
+				QuoteCost:   baseCapital.Mul(idx.Price).String(),
+				AvgEntry:    idx.Price.String(),
+				RealizedPnL: "0",
+			}
+			if err := s.store.SaveState(ctx, desks[i].BotID, state, models.NewStats()); err != nil {
+				return fmt.Errorf("reset spot accounting baseline for %s: %w", desks[i].ID, err)
+			}
 		}
 		// The strategy's investment is the quote budget for bids, not the
 		// desk's total capital. For spot desks half of the capital is held as
