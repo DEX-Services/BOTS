@@ -1,13 +1,15 @@
 // Package mm is the market-maker funding and lifecycle service. It sits above
-// the store and coordinates the "one number, three places" invariant: a desk's
-// allocated_usdc (DB source of truth), the MM wallet's engine-ledger balance
-// (in-memory, restart-wiped), and the underlying bot's investment budget must
-// always agree.
+// the store and coordinates the invariant: a desk's base_amount/quote_amount
+// (DB source of truth), the MM wallet's engine-ledger balances (in-memory,
+// restart-wiped), and the underlying bot's tracked inventory must agree.
 //
-// Funding is admin-attested: the admin moves real USDC into the treasury wallet
-// off-platform, then records the number here. Deposits credit the engine ledger
-// so the bot can quote against it; withdrawals debit it, guarded against capital
-// reserved behind live orders.
+// Funding is admin-attested and per-leg: the admin moves real assets into the
+// treasury wallet off-platform — the actual base asset (BTC, ETH, ...) AND the
+// actual quote asset (USDT, USDC, ...) — then records each amount here
+// separately. Neither leg is derived from the other by any formula; a desk
+// only ever holds what it was explicitly funded with. Deposits credit the
+// engine ledger so the bot can quote against it; withdrawals debit it,
+// guarded against capital reserved behind live orders.
 package mm
 
 import (
@@ -25,22 +27,13 @@ import (
 )
 
 // collateralAsset returns the currency required by the desk's market.
-// Spot markets use USDT; futures use USDC collateral.
+// Spot markets use USDT; futures use USDC collateral. This is the desk's
+// quote-leg asset; the base-leg asset is always desk.Base.
 func collateralAsset(market models.Market) string {
 	if market == models.Spot {
 		return "USDT"
 	}
 	return "USDC"
-}
-
-// spotBalances splits a spot desk's capital between the quote currency and
-// the base inventory required to maintain a two-sided book.
-func spotBalances(capital, indexPrice decimal.Decimal) (quote, base decimal.Decimal) {
-	quote = capital.Div(decimal.NewFromInt(2))
-	if indexPrice.IsPositive() {
-		base = quote.Div(indexPrice)
-	}
-	return quote, base
 }
 
 // Service orchestrates market-maker desks: creation, funding, and start/stop.
@@ -65,7 +58,8 @@ func walletFor(base string, market models.Market) string {
 
 // Create provisions a new desk: the underlying market_maker bot plus the
 // market_makers row that funds it. The desk starts disabled and unfunded; the
-// admin funds it with Deposit and starts it with SetEnabled.
+// admin funds both legs with Deposit(asset="base") / Deposit(asset="quote")
+// and starts it with SetEnabled.
 func (s *Service) Create(ctx context.Context, base string, market models.Market, symbol string, cfg map[string]string) (*models.MarketMaker, error) {
 	base = strings.ToUpper(strings.TrimSpace(base))
 	if base == "" {
@@ -102,9 +96,9 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	}
 
 	// Seed defaults so a fresh desk's strategy config is valid; any admin-supplied
-	// keys override. investment is NOT seeded here — a desk's budget is its
-	// allocated_usdc, which starts at 0 and only grows via Deposit. The desk
-	// therefore can't start until funded, which is the intended invariant.
+	// keys override. investment is NOT seeded here — a desk's quote budget is its
+	// quote_amount, which starts at 0 and only grows via Deposit(asset="quote").
+	// The desk therefore can't start until funded, which is the intended invariant.
 	merged := strategy.MMDefaults()
 	for k, v := range cfg {
 		if v != "" {
@@ -142,7 +136,8 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 		Symbol:        symbol,
 		WalletAddress: wallet,
 		BotID:         bot.ID,
-		AllocatedUSDC: "0",
+		BaseAmount:    "0",
+		QuoteAmount:   "0",
 		Enabled:       false,
 	}
 	if err := s.store.CreateMM(ctx, desk); err != nil {
@@ -153,13 +148,29 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	return desk, nil
 }
 
-// Deposit records an admin-attested capital add. It credits the MM wallet's
-// real Dex-Backend Postgres balance (the authoritative balance the engine risk-
-// locks orders against), mirrors the credit into the engine's in-memory ledger,
-// bumps allocated_usdc with an audit row, and syncs the bot's investment budget.
-// The backend credit runs first; each later step compensates the prior on
-// failure so the invariant holds.
-func (s *Service) Deposit(ctx context.Context, deskID string, amount decimal.Decimal, adminID, note string) (*models.MarketMaker, error) {
+// legAsset resolves the logical leg name ("base" or "quote") to the concrete
+// asset symbol for this desk (e.g. "BTC" / "USDT").
+func legAsset(desk *models.MarketMaker, leg string) (string, error) {
+	switch leg {
+	case "base":
+		return desk.Base, nil
+	case "quote":
+		return collateralAsset(desk.Market), nil
+	default:
+		return "", fmt.Errorf("asset must be %q or %q", "base", "quote")
+	}
+}
+
+// Deposit records an admin-attested capital add to one leg (leg: "base" or
+// "quote") of a desk. It credits the MM wallet's real Dex-Backend Postgres
+// balance for that specific asset (the authoritative balance the engine risk-
+// locks orders against), mirrors the credit into the engine's in-memory
+// ledger, bumps that leg's tracked amount with an audit row, and — for the
+// quote leg only — syncs the bot's investment budget (the strategy's bid-side
+// notional; the base leg has no equivalent single number, it's tracked
+// directly as inventory). The backend credit runs first; each later step
+// compensates the prior on failure so the invariant holds.
+func (s *Service) Deposit(ctx context.Context, deskID, leg string, amount decimal.Decimal, adminID, note string) (*models.MarketMaker, error) {
 	desk, err := s.store.GetMM(ctx, deskID)
 	if err != nil {
 		return nil, err
@@ -167,7 +178,10 @@ func (s *Service) Deposit(ctx context.Context, deskID string, amount decimal.Dec
 	if !amount.IsPositive() {
 		return nil, fmt.Errorf("amount must be positive")
 	}
-	asset := collateralAsset(desk.Market)
+	asset, err := legAsset(desk, leg)
+	if err != nil {
+		return nil, err
+	}
 	// Idempotent: covers desks provisioned before the users row existed.
 	if err := s.backend.EnsureUser(ctx, desk.WalletAddress); err != nil {
 		return nil, fmt.Errorf("ensure backend user: %w", err)
@@ -179,7 +193,7 @@ func (s *Service) Deposit(ctx context.Context, deskID string, amount decimal.Dec
 		_ = s.backend.CreditBalance(ctx, desk.WalletAddress, asset, amount.Neg())
 		return nil, fmt.Errorf("engine credit: %w", err)
 	}
-	next, err := s.store.Fund(ctx, deskID, "deposit", amount, decimal.Zero, adminID, note)
+	next, err := s.store.Fund(ctx, deskID, leg, "deposit", amount, decimal.Zero, adminID, note)
 	if err != nil {
 		// Credited both ledgers already; compensate so neither drifts above the
 		// DB source of truth.
@@ -187,16 +201,21 @@ func (s *Service) Deposit(ctx context.Context, deskID string, amount decimal.Dec
 		_ = s.backend.CreditBalance(ctx, desk.WalletAddress, asset, amount.Neg())
 		return nil, err
 	}
-	_ = s.store.UpdateInvestment(ctx, desk.BotID, next.String())
-	desk.AllocatedUSDC = next.String()
+	if leg == "quote" {
+		_ = s.store.UpdateInvestment(ctx, desk.BotID, next.String())
+		desk.QuoteAmount = next.String()
+	} else {
+		desk.BaseAmount = next.String()
+	}
 	return desk, nil
 }
 
-// Withdraw records an admin-attested capital removal. It reads the wallet's
-// available (unreserved) balance from the engine and refuses to pull capital
-// that is locked behind resting quotes, then debits the ledger and lowers
-// allocated_usdc with an audit row.
-func (s *Service) Withdraw(ctx context.Context, deskID string, amount decimal.Decimal, adminID, note string) (*models.MarketMaker, error) {
+// Withdraw records an admin-attested capital removal from one leg ("base" or
+// "quote") of a desk. It reads that leg's available (unreserved) balance from
+// the engine and refuses to pull capital that is locked behind resting
+// quotes, then debits the ledger and lowers that leg's tracked amount with an
+// audit row.
+func (s *Service) Withdraw(ctx context.Context, deskID, leg string, amount decimal.Decimal, adminID, note string) (*models.MarketMaker, error) {
 	desk, err := s.store.GetMM(ctx, deskID)
 	if err != nil {
 		return nil, err
@@ -204,7 +223,10 @@ func (s *Service) Withdraw(ctx context.Context, deskID string, amount decimal.De
 	if !amount.IsPositive() {
 		return nil, fmt.Errorf("amount must be positive")
 	}
-	asset := collateralAsset(desk.Market)
+	asset, err := legAsset(desk, leg)
+	if err != nil {
+		return nil, err
+	}
 	bal, err := s.engine.Balance(ctx, desk.WalletAddress, asset)
 	if err != nil {
 		return nil, fmt.Errorf("engine balance: %w", err)
@@ -212,25 +234,33 @@ func (s *Service) Withdraw(ctx context.Context, deskID string, amount decimal.De
 	// floor = allocated - available: the reserved portion the withdraw must not
 	// breach. Fund() rejects if (allocated - amount) < floor, i.e. amount >
 	// available.
-	alloc, _ := decimal.NewFromString(desk.AllocatedUSDC)
+	cur := desk.QuoteAmount
+	if leg == "base" {
+		cur = desk.BaseAmount
+	}
+	alloc, _ := decimal.NewFromString(cur)
 	floor := alloc.Sub(bal.Available)
-	next, err := s.store.Fund(ctx, deskID, "withdraw", amount, floor, adminID, note)
+	next, err := s.store.Fund(ctx, deskID, leg, "withdraw", amount, floor, adminID, note)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.engine.LedgerSync(ctx, desk.WalletAddress, asset, amount.String(), "debit"); err != nil {
 		// DB already lowered; restore it so it doesn't sink below the ledger.
-		_, _ = s.store.Fund(ctx, deskID, "deposit", amount, decimal.Zero, adminID, "revert: engine debit failed")
+		_, _ = s.store.Fund(ctx, deskID, leg, "deposit", amount, decimal.Zero, adminID, "revert: engine debit failed")
 		return nil, fmt.Errorf("engine debit: %w", err)
 	}
 	if err := s.backend.CreditBalance(ctx, desk.WalletAddress, asset, amount.Neg()); err != nil {
 		// Engine debited and DB lowered; roll both back so all three agree.
 		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, asset, amount.String(), "credit")
-		_, _ = s.store.Fund(ctx, deskID, "deposit", amount, decimal.Zero, adminID, "revert: backend debit failed")
+		_, _ = s.store.Fund(ctx, deskID, leg, "deposit", amount, decimal.Zero, adminID, "revert: backend debit failed")
 		return nil, fmt.Errorf("backend debit: %w", err)
 	}
-	_ = s.store.UpdateInvestment(ctx, desk.BotID, next.String())
-	desk.AllocatedUSDC = next.String()
+	if leg == "quote" {
+		_ = s.store.UpdateInvestment(ctx, desk.BotID, next.String())
+		desk.QuoteAmount = next.String()
+	} else {
+		desk.BaseAmount = next.String()
+	}
 	return desk, nil
 }
 
@@ -242,9 +272,9 @@ func (s *Service) SetEnabled(ctx context.Context, deskID string, enabled bool) e
 		return err
 	}
 	if enabled {
-		// A desk may be enabled after funding without a process restart. Reconcile
-		// its durable quote/base inventory first so Spot has the 50/50 USDT/BTC
-		// split required for a two-sided book.
+		// A desk may be enabled after funding without a process restart.
+		// Reconcile the engine ledger against whatever base/quote it was
+		// actually funded with first.
 		if err := s.Recredit(ctx); err != nil {
 			return fmt.Errorf("reconcile desk balances: %w", err)
 		}
@@ -272,14 +302,18 @@ func (s *Service) Delete(ctx context.Context, deskID string) error {
 			return fmt.Errorf("stop desk: %w", err)
 		}
 	}
-	// Reclaim the wallet fully: debit the engine mirror by its allocated amount
-	// and zero the authoritative Postgres balance (including any locks orphaned
-	// by an engine restart), so the wallet id can be safely reused by a future
-	// desk without inheriting a ghost balance.
-	if alloc, aerr := decimal.NewFromString(desk.AllocatedUSDC); aerr == nil && alloc.IsPositive() {
-		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, collateralAsset(desk.Market), alloc.String(), "debit")
+	// Reclaim the wallet fully: debit the engine mirror by each leg's funded
+	// amount and zero the authoritative Postgres balance (including any locks
+	// orphaned by an engine restart), so the wallet id can be safely reused by
+	// a future desk without inheriting a ghost balance.
+	if amt, aerr := decimal.NewFromString(desk.QuoteAmount); aerr == nil && amt.IsPositive() {
+		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, collateralAsset(desk.Market), amt.String(), "debit")
 	}
 	_ = s.backend.ResetBalance(ctx, desk.WalletAddress, collateralAsset(desk.Market))
+	if amt, aerr := decimal.NewFromString(desk.BaseAmount); aerr == nil && amt.IsPositive() {
+		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, desk.Base, amt.String(), "debit")
+	}
+	_ = s.backend.ResetBalance(ctx, desk.WalletAddress, desk.Base)
 	if err := s.store.DeleteMM(ctx, deskID); err != nil {
 		return err
 	}
@@ -316,7 +350,7 @@ func (s *Service) UpdateConfig(ctx context.Context, deskID string, config map[st
 	}
 	// Merge onto existing config so a partial update doesn't drop keys. symbol is
 	// fixed at create time; investment is driven by Deposit/Withdraw (it equals
-	// allocated_usdc), so neither can be retuned here.
+	// quote_amount), so neither can be retuned here.
 	if bot.Config == nil {
 		bot.Config = map[string]string{}
 	}
@@ -353,95 +387,48 @@ func (s *Service) OpenOrders(ctx context.Context, deskID string) ([]engine.OpenO
 	return s.engine.OpenOrders(ctx, desk.WalletAddress)
 }
 
-// Recredit reconciles the durable desk wallets before the matching engine
-// starts. The engine then performs one backfill of those balances into its
-// in-memory ledger. Keeping those phases separate prevents a restart from
-// crediting the engine twice.
-//
-// It also releases any Postgres-side locks orphaned by the same engine restart.
-// The engine wipes its in-memory book on restart and never sends the matching
-// /unlock for the orders it forgot, so the durable locked_usdc stays pinned at
-// the pre-restart holds and every new quote's balance lock fails with a 409.
-// Since the book is empty at this point, zeroing the locks is the truthful
-// reconciliation and matches the free=allocated state the mirror is set to.
-// This relies on the same "engine just restarted" precondition as the recredit
-// above; do NOT restart bots alone against a live engine holding real quotes.
+// Recredit reconciles the engine's in-memory ledger against each desk's
+// durably-funded base_amount/quote_amount after a restart. It does NOT
+// recompute, split, or overwrite either amount — both are exactly what the
+// admin funded via Deposit, independently, and stay that way across restarts.
+// This only exists because the engine's ledger is wiped on every restart and
+// refilled once, from Postgres, by its own startup backfill — which races
+// this call (the engine typically boots and backfills before this finishes,
+// so it can capture a stale pre-recredit figure if the backend balance
+// changed since). Left unsynced, the engine could keep quoting the
+// strategy's next Init() off that stale figure while the backend's real
+// balance is different, so the very first requote's lock request mismatches
+// and every subsequent one fails "insufficient balance to lock" forever.
 func (s *Service) Recredit(ctx context.Context) error {
 	desks, err := s.store.ListMM(ctx)
 	if err != nil {
 		return err
 	}
 	for i := range desks {
-		alloc, err := decimal.NewFromString(desks[i].AllocatedUSDC)
-		if err != nil || !alloc.IsPositive() {
-			continue
-		}
-		// Restore the durable ledger and the engine mirror from the same desk
-		// allocation. The backend is what approves order locks, so restoring only
-		// the engine ledger would leave a restarted desk able to quote in memory
-		// but unable to reserve its real collateral.
-		asset := collateralAsset(desks[i].Market)
-		quoteCapital := alloc
-		if desks[i].Market == models.Spot {
-			idx := s.manager.IndexSnapshot(ctx, desks[i].Symbol)
-			if !idx.Fresh || !idx.Price.IsPositive() {
-				return fmt.Errorf("spot desk %s has no fresh index price for inventory provisioning", desks[i].ID)
+		desk := &desks[i]
+		quoteAsset := collateralAsset(desk.Market)
+		if quoteAmt, err := decimal.NewFromString(desk.QuoteAmount); err == nil {
+			if err := s.syncEngineLedger(ctx, desk.WalletAddress, quoteAsset, quoteAmt); err != nil {
+				return fmt.Errorf("sync engine ledger (quote) for %s: %w", desk.ID, err)
 			}
-			var baseCapital decimal.Decimal
-			quoteCapital, baseCapital = spotBalances(alloc, idx.Price)
-			if err := s.backend.SyncBalance(ctx, desks[i].WalletAddress, desks[i].Base, baseCapital); err != nil {
-				return fmt.Errorf("sync base inventory for %s: %w", desks[i].ID, err)
-			}
-			// The engine's in-memory ledger is restart-wiped and only refilled once,
-			// from Postgres, by its own startup backfill — which races this Recredit
-			// (the engine typically boots and backfills before Recredit finishes, so
-			// it captures the pre-recredit balance). Left unsynced, the engine keeps
-			// quoting the strategy's next Init() off that stale figure while the
-			// backend's real balance is the fresh one Recredit just wrote, so the
-			// very first requote's lock request mismatches and every subsequent one
-			// fails "insufficient BTC balance to lock" forever. Push the same target
-			// into the engine ledger so both sides agree again.
-			if err := s.syncEngineLedger(ctx, desks[i].WalletAddress, desks[i].Base, baseCapital); err != nil {
-				return fmt.Errorf("sync engine ledger for %s: %w", desks[i].ID, err)
-			}
-			// Recredit deliberately resets the desk to a new 50/50 USDT/BTC
-			// inventory baseline. Seed the strategy's cost basis with that BTC at
-			// the same index price; otherwise its first sell treats provisioned BTC
-			// as free inventory and reports the entire sale value as "profit".
-			state := strategy.State{
-				OpenOrders:  map[string]strategy.OrderRef{},
-				BaseHeld:    baseCapital.String(),
-				QuoteCost:   baseCapital.Mul(idx.Price).String(),
-				AvgEntry:    idx.Price.String(),
-				RealizedPnL: "0",
-			}
-			if err := s.store.SaveState(ctx, desks[i].BotID, state, models.NewStats()); err != nil {
-				return fmt.Errorf("reset spot accounting baseline for %s: %w", desks[i].ID, err)
+			if err := s.store.UpdateInvestment(ctx, desk.BotID, quoteAmt.String()); err != nil {
+				return fmt.Errorf("sync bot investment for %s: %w", desk.ID, err)
 			}
 		}
-		// The strategy's investment is the quote budget for bids, not the
-		// desk's total capital. For spot desks half of the capital is held as
-		// base inventory for asks, so keeping the original total here would make
-		// each ladder reserve twice the USDT actually available.
-		if err := s.store.UpdateInvestment(ctx, desks[i].BotID, quoteCapital.String()); err != nil {
-			return fmt.Errorf("sync bot investment for %s: %w", desks[i].ID, err)
-		}
-		if err := s.backend.SyncBalance(ctx, desks[i].WalletAddress, asset, quoteCapital); err != nil {
-			return fmt.Errorf("sync backend balance for %s: %w", desks[i].ID, err)
-		}
-		if err := s.syncEngineLedger(ctx, desks[i].WalletAddress, asset, quoteCapital); err != nil {
-			return fmt.Errorf("sync engine ledger for %s: %w", desks[i].ID, err)
+		if baseAmt, err := decimal.NewFromString(desk.BaseAmount); err == nil {
+			if err := s.syncEngineLedger(ctx, desk.WalletAddress, desk.Base, baseAmt); err != nil {
+				return fmt.Errorf("sync engine ledger (base) for %s: %w", desk.ID, err)
+			}
 		}
 	}
 	return nil
 }
 
 // syncEngineLedger brings the engine's in-memory ledger balance for
-// (account, asset) to exactly target, mirroring what SyncBalanceFor just set
-// in the backend's Postgres row. The engine only exposes credit/debit deltas
-// (see /internal/ledger/sync), not an absolute set, so the delta is computed
-// against whatever the engine currently holds — which may itself be stale
-// after a restart (see the caller's comment).
+// (account, asset) to exactly target, mirroring the backend's durable value.
+// The engine only exposes credit/debit deltas (see /internal/ledger/sync),
+// not an absolute set, so the delta is computed against whatever the engine
+// currently holds — which may itself be stale after a restart (see Recredit).
 func (s *Service) syncEngineLedger(ctx context.Context, account, asset string, target decimal.Decimal) error {
 	current, err := s.engine.Balance(ctx, account, asset)
 	if err != nil {

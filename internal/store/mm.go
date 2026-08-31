@@ -1,7 +1,7 @@
 // mm.go is the market-maker persistence layer: the market_makers desks table
 // and the append-only mm_funding_ledger audit table. Funding operations mutate
-// allocated_usdc and write an audit row in one transaction so the balance and
-// its history never diverge.
+// base_amount/quote_amount and write an audit row in one transaction so the
+// balance and its history never diverge.
 package store
 
 import (
@@ -30,15 +30,30 @@ CREATE TABLE IF NOT EXISTS market_makers (
     symbol         TEXT        NOT NULL,
     wallet_address TEXT        NOT NULL UNIQUE,
     bot_id         TEXT        NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
-    allocated_usdc TEXT        NOT NULL DEFAULT '0',
+    base_amount    TEXT        NOT NULL DEFAULT '0',
+    quote_amount   TEXT        NOT NULL DEFAULT '0',
     enabled        BOOLEAN     NOT NULL DEFAULT FALSE,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (base, market)
 );
+-- Migrate desks created before base/quote were tracked separately: the old
+-- allocated_usdc column held quote-side capital only (base inventory was
+-- synthesized by a 50/50 split at recredit time, which no longer happens).
+ALTER TABLE market_makers ADD COLUMN IF NOT EXISTS base_amount TEXT NOT NULL DEFAULT '0';
+ALTER TABLE market_makers ADD COLUMN IF NOT EXISTS quote_amount TEXT NOT NULL DEFAULT '0';
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'market_makers' AND column_name = 'allocated_usdc') THEN
+        UPDATE market_makers SET quote_amount = allocated_usdc WHERE quote_amount = '0';
+        ALTER TABLE market_makers DROP COLUMN allocated_usdc;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS mm_funding_ledger (
     id              TEXT PRIMARY KEY,
     market_maker_id TEXT        NOT NULL REFERENCES market_makers(id) ON DELETE CASCADE,
+    asset           TEXT        NOT NULL DEFAULT 'quote',
     direction       TEXT        NOT NULL,
     amount          TEXT        NOT NULL,
     balance_after   TEXT        NOT NULL,
@@ -48,6 +63,7 @@ CREATE TABLE IF NOT EXISTS mm_funding_ledger (
 );
 CREATE INDEX IF NOT EXISTS mm_funding_mm_idx ON mm_funding_ledger(market_maker_id);
 ALTER TABLE mm_funding_ledger ADD COLUMN IF NOT EXISTS admin_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE mm_funding_ledger ADD COLUMN IF NOT EXISTS asset TEXT NOT NULL DEFAULT 'quote';
 `
 
 func (s *Store) migrateMM(ctx context.Context) error {
@@ -63,14 +79,17 @@ func (s *Store) CreateMM(ctx context.Context, mm *models.MarketMaker) error {
 	now := time.Now()
 	mm.CreatedAt = now
 	mm.UpdatedAt = now
-	if mm.AllocatedUSDC == "" {
-		mm.AllocatedUSDC = "0"
+	if mm.BaseAmount == "" {
+		mm.BaseAmount = "0"
+	}
+	if mm.QuoteAmount == "" {
+		mm.QuoteAmount = "0"
 	}
 	_, err := s.pool.Exec(ctx, `
-INSERT INTO market_makers (id, base, market, symbol, wallet_address, bot_id, allocated_usdc, enabled, created_at, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+INSERT INTO market_makers (id, base, market, symbol, wallet_address, bot_id, base_amount, quote_amount, enabled, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		mm.ID, mm.Base, string(mm.Market), mm.Symbol, mm.WalletAddress, mm.BotID,
-		mm.AllocatedUSDC, mm.Enabled, mm.CreatedAt, mm.UpdatedAt,
+		mm.BaseAmount, mm.QuoteAmount, mm.Enabled, mm.CreatedAt, mm.UpdatedAt,
 	)
 	return err
 }
@@ -128,13 +147,24 @@ func (s *Store) SetMMEnabled(ctx context.Context, id string, enabled bool) error
 	return nil
 }
 
-// Fund applies a funding change atomically: it re-reads allocated_usdc under a
-// row lock, computes the new balance, guards a withdraw against available
-// capital (caller supplies availableFloor — the balance below which a withdraw
-// is rejected, typically the amount reserved behind resting orders), updates
-// allocated_usdc, and appends an audit row. Returns the new balance. direction
-// is "deposit" or "withdraw"; amount must be positive.
-func (s *Store) Fund(ctx context.Context, id, direction string, amount decimal.Decimal, availableFloor decimal.Decimal, adminID, note string) (decimal.Decimal, error) {
+// mmAssetColumns maps the logical leg name ("base" or "quote") to its column.
+var mmAssetColumns = map[string]string{
+	"base":  "base_amount",
+	"quote": "quote_amount",
+}
+
+// Fund applies a funding change to one leg (asset: "base" or "quote") of a
+// desk atomically: it re-reads that leg's amount under a row lock, computes
+// the new balance, guards a withdraw against available capital (caller
+// supplies availableFloor — the balance below which a withdraw is rejected,
+// typically the amount reserved behind resting orders for that asset),
+// updates the column, and appends an audit row. Returns the new balance.
+// direction is "deposit" or "withdraw"; amount must be positive.
+func (s *Store) Fund(ctx context.Context, id, asset, direction string, amount decimal.Decimal, availableFloor decimal.Decimal, adminID, note string) (decimal.Decimal, error) {
+	column, ok := mmAssetColumns[asset]
+	if !ok {
+		return decimal.Zero, fmt.Errorf("asset must be %q or %q", "base", "quote")
+	}
 	if !amount.IsPositive() {
 		return decimal.Zero, fmt.Errorf("amount must be positive")
 	}
@@ -148,7 +178,7 @@ func (s *Store) Fund(ctx context.Context, id, direction string, amount decimal.D
 	defer tx.Rollback(ctx)
 
 	var curStr string
-	err = tx.QueryRow(ctx, `SELECT allocated_usdc FROM market_makers WHERE id=$1 FOR UPDATE`, id).Scan(&curStr)
+	err = tx.QueryRow(ctx, `SELECT `+column+` FROM market_makers WHERE id=$1 FOR UPDATE`, id).Scan(&curStr)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return decimal.Zero, ErrMMNotFound
 	}
@@ -157,7 +187,7 @@ func (s *Store) Fund(ctx context.Context, id, direction string, amount decimal.D
 	}
 	cur, err := decimal.NewFromString(curStr)
 	if err != nil {
-		return decimal.Zero, fmt.Errorf("corrupt allocated_usdc %q: %w", curStr, err)
+		return decimal.Zero, fmt.Errorf("corrupt %s %q: %w", column, curStr, err)
 	}
 
 	var next decimal.Decimal
@@ -171,13 +201,13 @@ func (s *Store) Fund(ctx context.Context, id, direction string, amount decimal.D
 		}
 	}
 
-	if _, err := tx.Exec(ctx, `UPDATE market_makers SET allocated_usdc=$2, updated_at=now() WHERE id=$1`, id, next.String()); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE market_makers SET `+column+`=$2, updated_at=now() WHERE id=$1`, id, next.String()); err != nil {
 		return decimal.Zero, err
 	}
 	if _, err := tx.Exec(ctx, `
-INSERT INTO mm_funding_ledger (id, market_maker_id, direction, amount, balance_after, admin_id, note, created_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,now())`,
-		uuid.NewString(), id, direction, amount.String(), next.String(), adminID, note); err != nil {
+INSERT INTO mm_funding_ledger (id, market_maker_id, asset, direction, amount, balance_after, admin_id, note, created_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())`,
+		uuid.NewString(), id, asset, direction, amount.String(), next.String(), adminID, note); err != nil {
 		return decimal.Zero, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -189,7 +219,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,now())`,
 // FundingHistory returns the audit rows for a desk, newest first.
 func (s *Store) FundingHistory(ctx context.Context, id string) ([]models.MMFundingEntry, error) {
 	rows, err := s.pool.Query(ctx, `
-SELECT id, market_maker_id, direction, amount, balance_after, admin_id, note, created_at
+SELECT id, market_maker_id, asset, direction, amount, balance_after, admin_id, note, created_at
 FROM mm_funding_ledger WHERE market_maker_id=$1 ORDER BY created_at DESC`, id)
 	if err != nil {
 		return nil, err
@@ -198,7 +228,7 @@ FROM mm_funding_ledger WHERE market_maker_id=$1 ORDER BY created_at DESC`, id)
 	out := []models.MMFundingEntry{}
 	for rows.Next() {
 		var e models.MMFundingEntry
-		if err := rows.Scan(&e.ID, &e.MarketMakerID, &e.Direction, &e.Amount, &e.BalanceAfter, &e.AdminID, &e.Note, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.MarketMakerID, &e.Asset, &e.Direction, &e.Amount, &e.BalanceAfter, &e.AdminID, &e.Note, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -206,13 +236,13 @@ FROM mm_funding_ledger WHERE market_maker_id=$1 ORDER BY created_at DESC`, id)
 	return out, rows.Err()
 }
 
-const mmSelect = `SELECT id, base, market, symbol, wallet_address, bot_id, allocated_usdc, enabled, created_at, updated_at FROM market_makers`
+const mmSelect = `SELECT id, base, market, symbol, wallet_address, bot_id, base_amount, quote_amount, enabled, created_at, updated_at FROM market_makers`
 
 func scanMM(row scanner) (*models.MarketMaker, error) {
 	var mm models.MarketMaker
 	var market string
 	err := row.Scan(&mm.ID, &mm.Base, &market, &mm.Symbol, &mm.WalletAddress,
-		&mm.BotID, &mm.AllocatedUSDC, &mm.Enabled, &mm.CreatedAt, &mm.UpdatedAt)
+		&mm.BotID, &mm.BaseAmount, &mm.QuoteAmount, &mm.Enabled, &mm.CreatedAt, &mm.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

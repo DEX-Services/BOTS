@@ -346,15 +346,32 @@ func (w *worker) shutdown(ctx context.Context) {
 // the authoritative reference for quoting (see marketMaker's doc comment);
 // stats need the same reference to stay consistent with reality. The book
 // mid remains the fallback for strategies/symbols with no index feed.
+//
+// market_maker desks use a different P/L model than every other strategy
+// here: quantity-based, not mark-to-market. A grid/DCA/TWAP bot's whole point
+// is capturing price movement, so avg-cost-vs-current-price is the right
+// measure for them. A market maker's profit is spread capture — ending up
+// with a different quantity of an asset than it started this run with — and
+// is independent of where the index price sits; see marketMaker.netPnL.
 func computeStats(s strategy.State, md marketdata.Snapshot, idx index.Snapshot, bot *models.Bot, startedAt, now time.Time) models.Stats {
-	realized := dec(s.RealizedPnL)
-	held := dec(s.BaseHeld)
-	avg := dec(s.AvgEntry)
 	mark := md.Mid
 	if idx.Fresh && idx.Price.IsPositive() {
 		mark = idx.Price
 	}
-	unrealized := held.Mul(mark.Sub(avg))
+
+	held := dec(s.BaseHeld)
+	avg := dec(s.AvgEntry)
+
+	var realized, unrealized decimal.Decimal
+	if bot.Strategy == "market_maker" {
+		baseDelta := held.Sub(dec(s.BaseAtInit))
+		quoteDelta := dec(s.QuoteHeld).Sub(dec(s.QuoteAtInit))
+		unrealized = baseDelta.Mul(mark).Add(quoteDelta)
+		realized = decimal.Zero // folded into unrealized above; kept separate stat at 0 to avoid double count
+	} else {
+		realized = dec(s.RealizedPnL)
+		unrealized = held.Mul(mark.Sub(avg))
+	}
 	net := realized.Add(unrealized)
 	roi := decimal.Zero
 	if inv := dec(bot.Investment); inv.IsPositive() {

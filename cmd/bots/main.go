@@ -89,20 +89,19 @@ func main() {
 	manager := runtime.NewManager(engineClient, hub, st, idx)
 
 	// Market-maker restart recovery runs before the matching engine starts (see
-	// run.sh). It restores durable desk balances; the engine's subsequent
-	// startup backfill creates its in-memory mirror exactly once.
+	// run.sh). It pushes each desk's durably-funded base_amount/quote_amount
+	// (set only by explicit admin Deposit/Withdraw calls, never derived by a
+	// formula) into the engine's in-memory ledger, which the engine's own
+	// startup backfill mirrors from Postgres exactly once at boot.
 	//
-	// The index reader connecting (above) only means Redis is reachable, not
-	// that a fresh price tick has landed yet — Recredit needs the latter for
-	// spot desks and fails immediately after a cold start. StartAll below
-	// unconditionally resumes any bot that was running before the restart,
-	// without going through the SetEnabled path that would otherwise retry
-	// Recredit, so a desk resumed here can be left quoting against its old
-	// pre-restart BaseHeld while the backend's real BTC balance was never
-	// re-synced — every requote then fails "insufficient BTC balance to lock"
-	// forever. Retry with a short backoff so a slow-to-warm index doesn't
+	// StartAll below unconditionally resumes any bot that was running before
+	// the restart, without going through the SetEnabled path that would
+	// otherwise retry Recredit on its own — so a desk resumed here can be left
+	// quoting against a stale engine balance if Recredit hasn't finished (e.g.
+	// a transient backend/engine connection hiccup at boot) before it starts.
+	// Retry with a short backoff so a slow-to-connect dependency doesn't
 	// strand a desk in that state; only fall through with a warning (rather
-	// than block startup indefinitely) if the feed genuinely never comes up.
+	// than block startup indefinitely) if it genuinely never comes up.
 	mmSvc := mm.NewService(st, engineClient, backendClient, manager)
 	recreditErr := mmSvc.Recredit(ctx)
 	for attempt := 0; recreditErr != nil && attempt < 5; attempt++ {

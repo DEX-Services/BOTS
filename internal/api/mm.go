@@ -46,20 +46,15 @@ func (s *Server) deskView(r *http.Request, desk *models.MarketMaker) mmDeskView 
 	if idx.Price.IsPositive() {
 		v.IndexPrice = idx.Price.String()
 	}
-	// Spot capital is deliberately split 50/50: quote liquidity backs bids and
-	// base inventory backs asks. Expose both values so the admin can verify the
-	// two-sided inventory directly from the desk card.
-	alloc, err := decimal.NewFromString(desk.AllocatedUSDC)
-	if err == nil && alloc.IsPositive() {
-		if desk.Market == models.Spot && idx.Price.IsPositive() {
-			v.QuoteAsset = "USDT"
-			v.QuoteBalance = alloc.Div(decimal.NewFromInt(2)).String()
-			v.BaseBalance = alloc.Div(decimal.NewFromInt(2)).Div(idx.Price).String()
-		} else {
-			v.QuoteAsset = "USDC"
-			v.QuoteBalance = alloc.String()
-		}
+	// Base and quote are funded independently now — no formula, just whatever
+	// the admin deposited into each leg. Expose both as-is.
+	if desk.Market == models.Spot {
+		v.QuoteAsset = "USDT"
+	} else {
+		v.QuoteAsset = "USDC"
 	}
+	v.QuoteBalance = desk.QuoteAmount
+	v.BaseBalance = desk.BaseAmount
 	return v
 }
 
@@ -107,6 +102,7 @@ func (s *Server) handleMMGet(w http.ResponseWriter, r *http.Request) {
 }
 
 type mmFundRequest struct {
+	Asset  string `json:"asset"` // "base" | "quote"
 	Amount string `json:"amount"`
 	Note   string `json:"note"`
 }
@@ -116,7 +112,7 @@ func (s *Server) handleMMDeposit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	desk, err := s.mm.Deposit(r.Context(), r.PathValue("id"), amount, adminID(r), req.Note)
+	desk, err := s.mm.Deposit(r.Context(), r.PathValue("id"), req.Asset, amount, adminID(r), req.Note)
 	if err != nil {
 		s.writeMMErr(w, err)
 		return
@@ -129,7 +125,7 @@ func (s *Server) handleMMWithdraw(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	desk, err := s.mm.Withdraw(r.Context(), r.PathValue("id"), amount, adminID(r), req.Note)
+	desk, err := s.mm.Withdraw(r.Context(), r.PathValue("id"), req.Asset, amount, adminID(r), req.Note)
 	if err != nil {
 		s.writeMMErr(w, err)
 		return
@@ -215,11 +211,17 @@ func (s *Server) handleMMStopAll(w http.ResponseWriter, r *http.Request) {
 	s.handleMMList(w, r)
 }
 
-// decodeFund parses and validates a fund request body.
+// decodeFund parses and validates a fund request body. asset must say which
+// leg of the desk the amount applies to — "base" (e.g. BTC, ETH) or "quote"
+// (e.g. USDT, USDC) — since the two are funded independently.
 func decodeFund(w http.ResponseWriter, r *http.Request) (decimal.Decimal, mmFundRequest, bool) {
 	var req mmFundRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid request body")
+		return decimal.Zero, req, false
+	}
+	if req.Asset != "base" && req.Asset != "quote" {
+		writeErr(w, http.StatusBadRequest, `asset must be "base" or "quote"`)
 		return decimal.Zero, req, false
 	}
 	amount, err := decimal.NewFromString(req.Amount)

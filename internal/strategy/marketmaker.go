@@ -32,6 +32,7 @@ type marketMaker struct {
 	state        *State
 	symbol       string
 	base         string
+	quoteAsset   string
 	market       models.Market
 	investment   decimal.Decimal
 	spreadBps    decimal.Decimal
@@ -133,11 +134,22 @@ func newMarketMaker(bot *models.Bot) (Strategy, error) {
 	}
 	return &marketMaker{
 		state: newStatePtr(), symbol: bot.Symbol, base: baseAsset(bot.Symbol),
+		quoteAsset: quoteAsset(bot.Market),
 		market: bot.Market, investment: investment, spreadBps: spreadBps,
 		levels: levels, levelStepBps: stepBps, maxInventory: maxInv,
 		leverage: lev, marginMode: cfg(bot, "marginMode"), requoteBps: requoteBps,
 		tick: decConfig(bot, "_tickSize"), lot: decConfig(bot, "_lotSize"),
 	}, nil
+}
+
+// quoteAsset returns the desk's quote-leg currency: USDT for spot, USDC for
+// futures collateral. Mirrors mm.collateralAsset (a different package, same
+// rule) since the strategy needs to read its own quote-asset balance too.
+func quoteAsset(market models.Market) string {
+	if market == models.Spot {
+		return "USDT"
+	}
+	return "USDC"
 }
 
 // decConfig parses a decimal config key, returning zero when absent or invalid.
@@ -156,20 +168,32 @@ func (m *marketMaker) Init(ctx context.Context, deps Deps) error {
 	if err := m.cancelWalletQuotes(ctx, deps); err != nil {
 		return err
 	}
-	// A spot desk's base inventory is funded outside the order stream. Never
-	// trust a persisted pre-restart cost basis for it: it can belong to a prior
-	// funding cycle and turn the desk's entire inventory value into a phantom
-	// P/L. Rebuild the baseline from the authoritative engine balance and the
-	// fresh external index before any new quotes are allowed.
-	if m.market == models.Spot && deps.Index.Fresh && deps.Index.Price.IsPositive() {
-		balance, err := deps.Engine.Balance(ctx, deps.Account, m.base)
+	// A spot desk's inventory is funded outside the order stream (the admin
+	// deposits actual base and quote amounts independently — see mm.Service).
+	// Never trust a persisted pre-restart baseline for it: it can belong to a
+	// prior funding cycle. Rebuild both legs from the authoritative engine
+	// balances before any new quotes are allowed.
+	//
+	// P/L for a market maker is deliberately quantity-based, not mark-to-
+	// market: holding the same 1000 BTC after the index moves from $100k to
+	// $120k is not a $20M profit, nothing was bought or sold. The only real
+	// profit is ending up with MORE of an asset than this run started with
+	// (spread capture), or less (a loss) — independent of price. So Init's
+	// job is just to snapshot "what do we hold right now" as the zero point;
+	// sampleEquity below diffs current holdings against this snapshot.
+	if m.market == models.Spot {
+		baseBal, err := deps.Engine.Balance(ctx, deps.Account, m.base)
 		if err != nil {
-			return fmt.Errorf("read spot inventory baseline: %w", err)
+			return fmt.Errorf("read base inventory baseline: %w", err)
 		}
-		held := balance.Balance
-		m.state.BaseHeld = held.String()
-		m.state.QuoteCost = held.Mul(deps.Index.Price).String()
-		m.state.AvgEntry = deps.Index.Price.String()
+		quoteBal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset)
+		if err != nil {
+			return fmt.Errorf("read quote inventory baseline: %w", err)
+		}
+		m.state.BaseHeld = baseBal.Balance.String()
+		m.state.QuoteHeld = quoteBal.Balance.String()
+		m.state.BaseAtInit = baseBal.Balance.String()
+		m.state.QuoteAtInit = quoteBal.Balance.String()
 		m.state.RealizedPnL = "0"
 		m.state.MatchedTrades = 0
 		m.state.TradeTimes = nil
@@ -379,7 +403,9 @@ func (m *marketMaker) detectFills(ctx context.Context, deps Deps) error {
 			// Still on the book: account any partial fill that has accrued while
 			// it rests, but keep tracking it.
 			r := ref
-			if m.state.applyFillDelta(&r, dec(filledStr), price).IsPositive() {
+			delta := m.state.applyFillDelta(&r, dec(filledStr), price)
+			if delta.IsPositive() {
+				m.applyQuoteDelta(r.Side, delta, price)
 				m.state.recordTrade(deps.MD.UpdatedAt)
 			}
 			m.state.OpenOrders[id] = r
@@ -399,7 +425,9 @@ func (m *marketMaker) detectFills(ctx context.Context, deps Deps) error {
 			continue
 		}
 		r := ref
-		if m.state.applyFillDelta(&r, dec(st.Filled), price).IsPositive() {
+		delta := m.state.applyFillDelta(&r, dec(st.Filled), price)
+		if delta.IsPositive() {
+			m.applyQuoteDelta(r.Side, delta, price)
 			m.state.recordTrade(deps.MD.UpdatedAt)
 		}
 		delete(m.state.OpenOrders, id)
@@ -407,14 +435,40 @@ func (m *marketMaker) detectFills(ctx context.Context, deps Deps) error {
 	return nil
 }
 
-// sampleEquity records equity (realized + unrealized vs the index mid) for the
-// drawdown/ROI curve.
+// applyQuoteDelta keeps QuoteHeld (the desk's actual quote-asset balance, e.g.
+// USDT) in step with a fill, mirroring what applyBuyFill/applySellFill just
+// did to BaseHeld: a BUY spends qty*price quote to gain qty base; a SELL
+// gains qty*price quote for the qty base given up. This is the quote-side
+// half of the quantity-based P/L model (see sampleEquity) — BaseHeld already
+// tracks the base side via the shared avg-cost helpers.
+func (m *marketMaker) applyQuoteDelta(side string, qty, price decimal.Decimal) {
+	notional := qty.Mul(price)
+	quoteHeld := dec(m.state.QuoteHeld)
+	if side == "BUY" {
+		m.state.QuoteHeld = quoteHeld.Sub(notional).String()
+	} else {
+		m.state.QuoteHeld = quoteHeld.Add(notional).String()
+	}
+}
+
+// sampleEquity records equity for the drawdown/ROI curve, using the
+// quantity-based P/L model: profit is holding MORE of an asset than this run
+// started with (spread capture), not the index price moving. The base-asset
+// delta since Init is valued at the current price only to express it in one
+// number alongside the quote-asset delta — a real price move with unchanged
+// holdings contributes exactly zero, unlike the old mark-to-market model.
 func (m *marketMaker) sampleEquity(mid decimal.Decimal) {
-	held := dec(m.state.BaseHeld)
-	avg := dec(m.state.AvgEntry)
-	unrealized := held.Mul(mid.Sub(avg))
-	equity := dec(m.state.RealizedPnL).Add(unrealized)
-	m.state.pushEquity(time.Now(), equity)
+	m.state.pushEquity(time.Now(), m.netPnL(mid))
+}
+
+// netPnL is (base held - base at Init) valued at the current price, plus
+// (quote held - quote at Init). Both deltas are zero until the desk's own
+// resting orders actually fill, so a bare index-price move never moves this
+// number.
+func (m *marketMaker) netPnL(mid decimal.Decimal) decimal.Decimal {
+	baseDelta := dec(m.state.BaseHeld).Sub(dec(m.state.BaseAtInit))
+	quoteDelta := dec(m.state.QuoteHeld).Sub(dec(m.state.QuoteAtInit))
+	return baseDelta.Mul(mid).Add(quoteDelta)
 }
 
 // qtyFor returns the base qty for a fixed quote notional at price.

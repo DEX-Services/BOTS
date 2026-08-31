@@ -61,6 +61,16 @@ type State struct {
 	NextSliceMs   int64               `json:"nextSliceMs"`
 	AvgEntry      string              `json:"avgEntry"`
 	InitDone      bool                `json:"initDone"`
+	// QuoteHeld, BaseAtInit, and QuoteAtInit are market-maker-only: the desk's
+	// current quote-asset (e.g. USDT) balance, and the base/quote quantities
+	// snapshotted the moment the bot last started (Init). P/L for a
+	// market-maker desk is quantity-based, not mark-to-market: it does not
+	// matter whether the index price moved, only whether the desk ended up
+	// holding more or less of each asset than it started with this run. See
+	// marketMaker.sampleEquity.
+	QuoteHeld   string `json:"quoteHeld,omitempty"`
+	BaseAtInit  string `json:"baseAtInit,omitempty"`
+	QuoteAtInit string `json:"quoteAtInit,omitempty"`
 }
 
 // OrderRef is a tracked resting order placed by the bot.
