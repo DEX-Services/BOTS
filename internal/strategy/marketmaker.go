@@ -265,9 +265,22 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 	// every single tick until the price recovers. Splitting the held balance
 	// itself evenly across levels keeps the ladder inside the wallet no
 	// matter how far the index has moved since funding.
+	//
+	// sellReserveBps carves out a small safety margin (0.5%) rather than
+	// sizing the ladder to sum to exactly 100% of held. A sell quote that
+	// fills lands asynchronously (detectFills only reconciles it on the next
+	// tick), so "held" here can be a few ticks stale relative to the wallet's
+	// real-time balance. Quoting the literal last unit of inventory means any
+	// fill in that window — or even lot-size snapping rounding the wrong way
+	// — tips the ladder's total ask notional a hair over what's actually free,
+	// and every requote fails "insufficient balance to lock" until a BUY fill
+	// happens to replenish it. A standing buffer absorbs that race instead of
+	// depending on exact-balance timing.
+	sellReserveBps := decimal.NewFromInt(50) // 0.5%
 	sellPerLevel := decimal.Zero
 	if m.market == models.Spot && held.IsPositive() {
-		sellPerLevel = held.Div(numLevels)
+		sellable := held.Mul(tenK.Sub(sellReserveBps)).Div(tenK)
+		sellPerLevel = sellable.Div(numLevels)
 	}
 
 	quotes := make([]engine.MarketMakerQuote, 0, m.levels*2)
