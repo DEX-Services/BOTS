@@ -89,19 +89,20 @@ func main() {
 	manager := runtime.NewManager(engineClient, hub, st, idx)
 
 	// Market-maker restart recovery runs before the matching engine starts (see
-	// run.sh). It pushes each desk's durably-funded base_amount/quote_amount
-	// (set only by explicit admin Deposit/Withdraw calls, never derived by a
-	// formula) into the engine's in-memory ledger, which the engine's own
-	// startup backfill mirrors from Postgres exactly once at boot.
+	// run.sh). It clears the durable Postgres locks orphaned by the engine's
+	// restart (the engine's own live book is gone, but nothing tells Postgres
+	// that) and re-syncs each desk's investment budget — it never touches
+	// actual balances, which the engine's own startup backfill already primes
+	// correctly from the same Postgres row (see mm.Service.Recredit's doc).
 	//
 	// StartAll below unconditionally resumes any bot that was running before
 	// the restart, without going through the SetEnabled path that would
 	// otherwise retry Recredit on its own — so a desk resumed here can be left
-	// quoting against a stale engine balance if Recredit hasn't finished (e.g.
-	// a transient backend/engine connection hiccup at boot) before it starts.
-	// Retry with a short backoff so a slow-to-connect dependency doesn't
-	// strand a desk in that state; only fall through with a warning (rather
-	// than block startup indefinitely) if it genuinely never comes up.
+	// with stale locks if Recredit hasn't finished (e.g. a transient backend
+	// connection hiccup at boot) before it starts. Retry with a short backoff
+	// so a slow-to-connect dependency doesn't strand a desk in that state;
+	// only fall through with a warning (rather than block startup
+	// indefinitely) if it genuinely never comes up.
 	mmSvc := mm.NewService(st, engineClient, backendClient, manager)
 	recreditErr := mmSvc.Recredit(ctx)
 	for attempt := 0; recreditErr != nil && attempt < 5; attempt++ {

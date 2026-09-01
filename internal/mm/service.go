@@ -387,18 +387,37 @@ func (s *Service) OpenOrders(ctx context.Context, deskID string) ([]engine.OpenO
 	return s.engine.OpenOrders(ctx, desk.WalletAddress)
 }
 
-// Recredit reconciles the engine's in-memory ledger against each desk's
-// durably-funded base_amount/quote_amount after a restart. It does NOT
-// recompute, split, or overwrite either amount — both are exactly what the
-// admin funded via Deposit, independently, and stay that way across restarts.
-// This only exists because the engine's ledger is wiped on every restart and
-// refilled once, from Postgres, by its own startup backfill — which races
-// this call (the engine typically boots and backfills before this finishes,
-// so it can capture a stale pre-recredit figure if the backend balance
-// changed since). Left unsynced, the engine could keep quoting the
-// strategy's next Init() off that stale figure while the backend's real
-// balance is different, so the very first requote's lock request mismatches
-// and every subsequent one fails "insufficient balance to lock" forever.
+// Recredit clears restart-orphaned locks and re-syncs the bot's investment
+// budget after a restart. It does NOT touch either leg's actual balance in
+// the engine or the backend.
+//
+// Two things matter here:
+//
+//  1. base_amount/quote_amount on the market_makers row are the desk's
+//     FUNDING record (what Deposit/Withdraw moved), not a live balance —
+//     Dex-Backend's Postgres user_balances is the one authoritative balance
+//     (see package doc, and backend.Client's doc comment). Once real fills
+//     or locks have touched a desk's wallet, its actual balance can and will
+//     differ from base_amount/quote_amount (e.g. a filled sell nets out
+//     slightly less base than was funded). Recredit must never push
+//     base_amount/quote_amount into the engine ledger as if it were the
+//     truth — that would silently overwrite a correct, drifted balance with
+//     a stale funding figure and hand the strategy a wrong BaseHeld. The
+//     engine's own startup backfill (see matching-engine's Backfill call,
+//     which reads directly from the same Postgres row) already primes the
+//     in-memory ledger correctly; Recredit's job ends at investment sync.
+//
+//  2. The matching engine's restart wipes its own live order book, but the
+//     durable Postgres `locked` column (what ReplaceLocksFor/LockBalance
+//     guard against) is never told the book is gone — nothing calls
+//     /internal/balance/release-locks on the engine's behalf. So a desk that
+//     had its full inventory locked behind resting quotes before the restart
+//     comes back with `locked` still pinned at (or right at) its total
+//     balance, leaving zero room for ANY new lock — every requote after a
+//     restart then fails "insufficient balance to lock" forever, even though
+//     nothing is actually reserved any more (the orders backing that lock no
+//     longer exist). ReleaseLocks clears exactly that stale hold, for both
+//     legs, before quoting resumes.
 func (s *Service) Recredit(ctx context.Context) error {
 	desks, err := s.store.ListMM(ctx)
 	if err != nil {
@@ -407,39 +426,21 @@ func (s *Service) Recredit(ctx context.Context) error {
 	for i := range desks {
 		desk := &desks[i]
 		quoteAsset := collateralAsset(desk.Market)
+		if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, quoteAsset); err != nil {
+			return fmt.Errorf("release stale quote locks for %s: %w", desk.ID, err)
+		}
+		if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, desk.Base); err != nil {
+			return fmt.Errorf("release stale base locks for %s: %w", desk.ID, err)
+		}
+		// investment (the strategy's bid-side quote budget) is the one field
+		// legitimately re-derived from quote_amount on every restart — it's
+		// strategy config, not a balance, and always meant to track the
+		// desk's currently-funded quote leg.
 		if quoteAmt, err := decimal.NewFromString(desk.QuoteAmount); err == nil {
-			if err := s.syncEngineLedger(ctx, desk.WalletAddress, quoteAsset, quoteAmt); err != nil {
-				return fmt.Errorf("sync engine ledger (quote) for %s: %w", desk.ID, err)
-			}
 			if err := s.store.UpdateInvestment(ctx, desk.BotID, quoteAmt.String()); err != nil {
 				return fmt.Errorf("sync bot investment for %s: %w", desk.ID, err)
 			}
 		}
-		if baseAmt, err := decimal.NewFromString(desk.BaseAmount); err == nil {
-			if err := s.syncEngineLedger(ctx, desk.WalletAddress, desk.Base, baseAmt); err != nil {
-				return fmt.Errorf("sync engine ledger (base) for %s: %w", desk.ID, err)
-			}
-		}
 	}
 	return nil
-}
-
-// syncEngineLedger brings the engine's in-memory ledger balance for
-// (account, asset) to exactly target, mirroring the backend's durable value.
-// The engine only exposes credit/debit deltas (see /internal/ledger/sync),
-// not an absolute set, so the delta is computed against whatever the engine
-// currently holds — which may itself be stale after a restart (see Recredit).
-func (s *Service) syncEngineLedger(ctx context.Context, account, asset string, target decimal.Decimal) error {
-	current, err := s.engine.Balance(ctx, account, asset)
-	if err != nil {
-		return fmt.Errorf("read engine balance: %w", err)
-	}
-	delta := target.Sub(current.Balance)
-	if delta.IsZero() {
-		return nil
-	}
-	if delta.IsPositive() {
-		return s.engine.LedgerSync(ctx, account, asset, delta.String(), "credit")
-	}
-	return s.engine.LedgerSync(ctx, account, asset, delta.Neg().String(), "debit")
 }
