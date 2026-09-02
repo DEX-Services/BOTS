@@ -142,12 +142,12 @@ func newMarketMaker(bot *models.Bot) (Strategy, error) {
 	}, nil
 }
 
-// quoteAsset returns the desk's quote-leg currency: USDT for spot, USDC for
+// quoteAsset returns the desk's quote-leg currency: USDB for spot, USDC for
 // futures collateral. Mirrors mm.collateralAsset (a different package, same
 // rule) since the strategy needs to read its own quote-asset balance too.
 func quoteAsset(market models.Market) string {
 	if market == models.Spot {
-		return "USDT"
+		return "USDB"
 	}
 	return "USDC"
 }

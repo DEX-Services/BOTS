@@ -5,7 +5,7 @@
 //
 // Funding is admin-attested and per-leg: the admin moves real assets into the
 // treasury wallet off-platform — the actual base asset (BTC, ETH, ...) AND the
-// actual quote asset (USDT, USDC, ...) — then records each amount here
+// actual quote asset (USDB for spot, USDC for futures) — then records each amount here
 // separately. Neither leg is derived from the other by any formula; a desk
 // only ever holds what it was explicitly funded with. Deposits credit the
 // engine ledger so the bot can quote against it; withdrawals debit it,
@@ -27,11 +27,11 @@ import (
 )
 
 // collateralAsset returns the currency required by the desk's market.
-// Spot markets use USDT; futures use USDC collateral. This is the desk's
+// Spot markets use USDB; futures use USDC collateral. This is the desk's
 // quote-leg asset; the base-leg asset is always desk.Base.
 func collateralAsset(market models.Market) string {
 	if market == models.Spot {
-		return "USDT"
+		return "USDB"
 	}
 	return "USDC"
 }
@@ -149,7 +149,7 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 }
 
 // legAsset resolves the logical leg name ("base" or "quote") to the concrete
-// asset symbol for this desk (e.g. "BTC" / "USDT").
+// asset symbol for this desk (e.g. "BTC" / "USDB").
 func legAsset(desk *models.MarketMaker, leg string) (string, error) {
 	switch leg {
 	case "base":

@@ -49,7 +49,7 @@ func (s *Server) deskView(r *http.Request, desk *models.MarketMaker) mmDeskView 
 	// Base and quote are funded independently now — no formula, just whatever
 	// the admin deposited into each leg. Expose both as-is.
 	if desk.Market == models.Spot {
-		v.QuoteAsset = "USDT"
+		v.QuoteAsset = "USDB"
 	} else {
 		v.QuoteAsset = "USDC"
 	}
