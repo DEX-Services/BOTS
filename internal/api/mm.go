@@ -47,12 +47,9 @@ func (s *Server) deskView(r *http.Request, desk *models.MarketMaker) mmDeskView 
 		v.IndexPrice = idx.Price.String()
 	}
 	// Base and quote are funded independently now — no formula, just whatever
-	// the admin deposited into each leg. Expose both as-is.
-	if desk.Market == models.Spot {
-		v.QuoteAsset = "USDB"
-	} else {
-		v.QuoteAsset = "USDC"
-	}
+	// the admin deposited into each leg. Expose both as-is. Every market —
+	// spot and futures — quotes in USDB.
+	v.QuoteAsset = "USDB"
 	v.QuoteBalance = desk.QuoteAmount
 	v.BaseBalance = desk.BaseAmount
 	return v

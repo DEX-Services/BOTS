@@ -5,11 +5,11 @@
 //
 // Funding is admin-attested and per-leg: the admin moves real assets into the
 // treasury wallet off-platform — the actual base asset (BTC, ETH, ...) AND the
-// actual quote asset (USDB for spot, USDC for futures) — then records each amount here
-// separately. Neither leg is derived from the other by any formula; a desk
-// only ever holds what it was explicitly funded with. Deposits credit the
-// engine ledger so the bot can quote against it; withdrawals debit it,
-// guarded against capital reserved behind live orders.
+// actual quote asset (USDB for both spot and futures) — then records each
+// amount here separately. Neither leg is derived from the other by any
+// formula; a desk only ever holds what it was explicitly funded with.
+// Deposits credit the engine ledger so the bot can quote against it;
+// withdrawals debit it, guarded against capital reserved behind live orders.
 package mm
 
 import (
@@ -26,14 +26,14 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// collateralAsset returns the currency required by the desk's market.
-// Spot markets use USDB; futures use USDC collateral. This is the desk's
-// quote-leg asset; the base-leg asset is always desk.Base.
+// collateralAsset returns the currency required by the desk's market. Every
+// market — spot and futures alike — quotes and collateralizes in USDB, the
+// platform's internal stable currency; futures collateral used to be real
+// USDC, now converts to/settles in USDB like everything else on the
+// exchange. This is the desk's quote-leg asset; the base-leg asset is always
+// desk.Base.
 func collateralAsset(market models.Market) string {
-	if market == models.Spot {
-		return "USDB"
-	}
-	return "USDC"
+	return "USDB"
 }
 
 // Service orchestrates market-maker desks: creation, funding, and start/stop.

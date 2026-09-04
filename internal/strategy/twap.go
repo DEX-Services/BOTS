@@ -30,7 +30,7 @@ type twap struct {
 
 func twapParams() []models.TemplateParam {
 	return []models.TemplateParam{
-		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-USDC"},
+		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-USDB"},
 		{Key: "investment", Label: "Reference Budget (quote)", Type: "number", Required: false, Default: "1000"},
 		{Key: "side", Label: "Side", Type: "select", Required: true, Default: "BUY", Options: []string{"BUY", "SELL"}},
 		{Key: "totalQty", Label: "Total Quantity (base)", Type: "number", Required: true, Default: "1", Help: "Total base size to execute"},
