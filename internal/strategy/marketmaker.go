@@ -249,10 +249,30 @@ func (m *marketMaker) drifted(mid decimal.Decimal) bool {
 // requote cancels all resting quotes and places a fresh ladder around mid.
 func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decimal, timestampMs int64) error {
 	held := dec(m.state.BaseHeld)
-	// Per-level quote notional: split the budget evenly across all levels/side.
-	perLevel := m.investment.Div(decimal.NewFromInt(int64(m.levels)))
 	tenK := decimal.NewFromInt(10000)
 	numLevels := decimal.NewFromInt(int64(m.levels))
+	// Per-level quote notional: split the budget evenly across all levels/side.
+	//
+	// Futures BUY and SELL both margin against the same quote currency, so
+	// the investment budget must be split in half between the two sides
+	// before dividing across levels — sizing each side off the FULL
+	// investment independently (the old behavior) asked the engine to
+	// reserve investment worth of margin for the buy side AND investment
+	// worth for the sell side, i.e. 2x investment total across a full
+	// two-sided ladder. That 2x mismatch is invisible at desk creation
+	// (nothing checks it there) and only surfaces once quoting actually
+	// starts, as every requote failing "insufficient balance to lock"
+	// forever — the desk was always funded for exactly half of what its own
+	// ladder asked the engine to reserve.
+	//
+	// Spot does NOT have this problem: its BUY side draws from quote_amount
+	// (USDB/USDT) and its SELL side is capped by actual held BASE inventory
+	// (see sellPerLevel below) — two independent currencies/pools, so the
+	// full investment is correctly available to size the buy side alone.
+	perLevel := m.investment.Div(numLevels)
+	if m.market == models.Futures {
+		perLevel = m.investment.Div(decimal.NewFromInt(2)).Div(numLevels)
+	}
 
 	// SELL side sizing must be capped by actual held base inventory, not
 	// re-derived from the quote-denominated investment budget. Sizing each
@@ -322,6 +342,27 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 	if err != nil {
 		return err
 	}
+	// A resting order can fill — fully or partially — in the instant before
+	// this same replace call cancels it. detectFills reconciles fills for
+	// every OTHER tick via a live /orders poll, but an order this replace
+	// itself just tore down never appears in such a poll again; resp.Removed
+	// is the ONLY place its true final Filled ever surfaces. Skipping this
+	// would silently lose that fill forever — real inventory moves, the
+	// strategy's BaseHeld never catches up, and every later requote asks the
+	// engine to lock more than is actually left (see engine's MMReplaceResponse
+	// doc comment).
+	for _, o := range resp.Removed {
+		ref, ok := m.state.OpenOrders[o.ID]
+		if !ok {
+			continue
+		}
+		price := dec(ref.Price)
+		delta := m.state.applyFillDelta(&ref, dec(o.Filled), price)
+		if delta.IsPositive() {
+			m.applyQuoteDelta(ref.Side, delta, price)
+			m.state.recordTrade(deps.MD.UpdatedAt)
+		}
+	}
 	m.state.OpenOrders = make(map[string]OrderRef, len(resp.Orders))
 	for _, o := range resp.Orders {
 		m.state.OpenOrders[o.ID] = OrderRef{OrderID: o.ID, Side: o.Side, Price: o.Price, Qty: o.Qty, Level: -1, Kind: "mm"}
@@ -376,8 +417,25 @@ func (m *marketMaker) place(ctx context.Context, deps Deps, side string, level i
 // detectFills reconciles it against authoritative state instead of dropping a
 // possible fill.
 func (m *marketMaker) cancelAll(ctx context.Context, deps Deps) error {
-	if err := deps.Engine.ClearMarketMakerLadder(ctx, deps.Account, m.symbol, string(m.market)); err != nil {
+	resp, err := deps.Engine.ClearMarketMakerLadder(ctx, deps.Account, m.symbol, string(m.market))
+	if err != nil {
 		return err
+	}
+	// Same reconciliation requote does: a resting order can fill in the
+	// instant before this same call cancels it, and Removed is the only
+	// place that fill's true final state ever surfaces (see requote's
+	// comment on resp.Removed).
+	for _, o := range resp.Removed {
+		ref, ok := m.state.OpenOrders[o.ID]
+		if !ok {
+			continue
+		}
+		price := dec(ref.Price)
+		delta := m.state.applyFillDelta(&ref, dec(o.Filled), price)
+		if delta.IsPositive() {
+			m.applyQuoteDelta(ref.Side, delta, price)
+			m.state.recordTrade(deps.MD.UpdatedAt)
+		}
 	}
 	m.state.OpenOrders = map[string]OrderRef{}
 	return nil

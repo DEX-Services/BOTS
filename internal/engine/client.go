@@ -118,6 +118,11 @@ type MarketMakerQuote struct {
 type MarketMakerReplaceResponse struct {
 	Status string      `json:"status"`
 	Orders []OpenOrder `json:"orders"`
+	// Removed carries the final Filled/Status of every order this replace
+	// cancelled from the previous ladder — see the engine's MMReplaceResponse
+	// doc comment for why this matters (a fill in the instant before
+	// cancellation is otherwise invisible to the strategy forever).
+	Removed []OpenOrder `json:"removed"`
 }
 
 // OpenOrder is one entry from /orders.
@@ -205,10 +210,11 @@ func (c *Client) ReplaceMarketMakerLadder(ctx context.Context, account, symbol, 
 }
 
 // ClearMarketMakerLadder removes all live quotes for the dedicated MM account
-// in one engine command and releases its aggregate reservation.
-func (c *Client) ClearMarketMakerLadder(ctx context.Context, account, symbol, market string) error {
-	_, err := c.ReplaceMarketMakerLadder(ctx, account, symbol, market, decimal.Zero, time.Now().UnixMilli(), nil)
-	return err
+// in one engine command and releases its aggregate reservation. Returns the
+// same response ReplaceMarketMakerLadder would, including Removed — a fill
+// can still land on a resting order in the instant before this clears it.
+func (c *Client) ClearMarketMakerLadder(ctx context.Context, account, symbol, market string) (MarketMakerReplaceResponse, error) {
+	return c.ReplaceMarketMakerLadder(ctx, account, symbol, market, decimal.Zero, time.Now().UnixMilli(), nil)
 }
 
 // CancelOrder cancels a resting order.
