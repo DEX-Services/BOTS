@@ -271,7 +271,33 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 	// full investment is correctly available to size the buy side alone.
 	perLevel := m.investment.Div(numLevels)
 	if m.market == models.Futures {
-		perLevel = m.investment.Div(decimal.NewFromInt(2)).Div(numLevels)
+		// Budget off the account's LIVE quote balance, not the static
+		// investment config. investment is a snapshot from whenever the desk
+		// was funded/last recredited; real trading — fees, realized PnL on
+		// closed legs, a partial liquidation — moves the actual balance both
+		// up and down from then on, and investment never follows it. Once
+		// real drift exceeds even a generous fixed-percentage buffer on top
+		// of the stale number, every requote fails "insufficient balance to
+		// lock" forever (the account HAS the room, investment just doesn't
+		// know about it any more). Reading the true current balance here
+		// keeps this self-correcting regardless of how far reality has
+		// moved from the number the desk happened to be funded with.
+		//
+		// This is the total balance, not Available: the old ladder's
+		// reservation is about to be released and replaced by this same
+		// call, so what matters is what will be free once that happens —
+		// which is the full balance, not balance-minus-the-old-lock.
+		budget := m.investment
+		if bal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset); err == nil && bal.Balance.IsPositive() {
+			budget = bal.Balance
+		}
+		// futuresReserveBps carves out the same kind of safety margin spot's
+		// sell side reserves (see sellReserveBps below): even sizing off the
+		// live balance, a fill landing mid-requote (detectFills only
+		// reconciles on the NEXT tick) can still nudge it a hair past exact.
+		futuresReserveBps := decimal.NewFromInt(20) // 0.2%
+		budget = budget.Mul(tenK.Sub(futuresReserveBps)).Div(tenK)
+		perLevel = budget.Div(decimal.NewFromInt(2)).Div(numLevels)
 	}
 
 	// SELL side sizing must be capped by actual held base inventory, not
