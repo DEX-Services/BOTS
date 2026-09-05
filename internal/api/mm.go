@@ -41,7 +41,7 @@ func (s *Server) deskView(r *http.Request, desk *models.MarketMaker) mmDeskView 
 		v.Stats = bot.Stats
 		v.Config = bot.Config
 	}
-	idx := s.manager.IndexSnapshot(r.Context(), desk.Symbol)
+	idx := s.manager.IndexSnapshot(r.Context(), desk.Symbol, v.Config)
 	v.IndexFresh = idx.Fresh
 	if idx.Price.IsPositive() {
 		v.IndexPrice = idx.Price.String()

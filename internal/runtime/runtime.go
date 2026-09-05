@@ -114,7 +114,7 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 	deps := strategy.Deps{
 		Engine: m.engine, Account: bot.WalletAddress, Bot: bot,
 		MD:    m.hub.Snapshot(bot.Symbol, string(bot.Market)),
-		Index: m.indexSnapshot(ctx, bot.Symbol),
+		Index: m.indexSnapshot(ctx, bot.Symbol, bot.Config),
 	}
 	// Strategies may reconcile external state before they begin ticking. In
 	// particular, a market maker clears stale persisted order IDs here so a
@@ -247,19 +247,31 @@ func (m *Manager) remove(w *worker) {
 }
 
 // indexSnapshot returns the current index-price snapshot for a symbol's base
-// asset, or a zero (stale) snapshot when no index reader is configured.
-func (m *Manager) indexSnapshot(ctx context.Context, symbol string) index.Snapshot {
+// asset, or a zero (stale) snapshot when no index reader is configured. A bot
+// config may pin the exact Redis ticker via "_indexTicker" — needed when the
+// real key's casing doesn't survive baseAsset's uppercasing ("CrudeOIL-USDB"
+// -> "CRUDEOIL", "AAPL.us-USDB" -> "AAPL.US", neither of which is a key
+// Price-Fetcher ever writes). Without that override the lookup falls back to
+// the pair-derived base asset ("BTC-USDB" -> "BTC").
+func (m *Manager) indexSnapshot(ctx context.Context, symbol string, cfg map[string]string) index.Snapshot {
 	if m.index == nil {
 		return index.Snapshot{}
+	}
+	if ticker := strings.TrimSpace(cfg["_indexTicker"]); ticker != "" {
+		return m.index.GetExact(ctx, ticker, time.Now().UnixMilli())
 	}
 	return m.index.Get(ctx, baseAsset(symbol), time.Now().UnixMilli())
 }
 
-// IndexSnapshot exposes the index snapshot for a symbol to callers outside the
-// runtime (e.g. the MM admin API computing marked P/L). Returns a zero (stale)
-// snapshot when no index reader is configured.
-func (m *Manager) IndexSnapshot(ctx context.Context, symbol string) index.Snapshot {
-	return m.indexSnapshot(ctx, symbol)
+// IndexSnapshot exposes the index snapshot for a bot's symbol to callers
+// outside the runtime (e.g. the MM admin API showing a desk's index price).
+// cfg is the bot's strategy config, consulted for the "_indexTicker" override
+// exactly as the quoting path does — pass it so the admin view reads the same
+// Redis key the desk actually quotes against, rather than reporting "no index"
+// for the mixed-case tickers. Returns a zero (stale) snapshot when no index
+// reader is configured.
+func (m *Manager) IndexSnapshot(ctx context.Context, symbol string, cfg map[string]string) index.Snapshot {
+	return m.indexSnapshot(ctx, symbol, cfg)
 }
 
 // IndexSnapshotExact looks up the index price for an EXACT asset ticker, with
@@ -296,7 +308,7 @@ func (w *worker) tick(ctx context.Context) (halt bool) {
 	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
 	deps := strategy.Deps{
 		Engine: w.manager.engine, Account: w.bot.WalletAddress,
-		Bot: w.bot, MD: md, Index: w.manager.indexSnapshot(ctx, w.bot.Symbol),
+		Bot: w.bot, MD: md, Index: w.manager.indexSnapshot(ctx, w.bot.Symbol, w.bot.Config),
 	}
 	if err := w.strategy.OnTick(ctx, deps); err != nil {
 		w.consecutiveErrors++
@@ -316,7 +328,7 @@ func (w *worker) tick(ctx context.Context) (halt bool) {
 
 func (w *worker) persist(ctx context.Context) {
 	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
-	idx := w.manager.indexSnapshot(ctx, w.bot.Symbol)
+	idx := w.manager.indexSnapshot(ctx, w.bot.Symbol, w.bot.Config)
 	state := w.strategy.Snapshot()
 	stats := computeStats(state, md, idx, w.bot, w.startedAt, time.Now())
 	if err := w.manager.store.SaveState(ctx, w.bot.ID, state, stats); err != nil {

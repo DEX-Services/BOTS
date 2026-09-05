@@ -61,32 +61,32 @@ func walletFor(base string, market models.Market) string {
 // admin funds both legs with Deposit(asset="base") / Deposit(asset="quote")
 // and starts it with SetEnabled.
 func (s *Service) Create(ctx context.Context, base string, market models.Market, symbol string, cfg map[string]string) (*models.MarketMaker, error) {
-	base = strings.ToUpper(strings.TrimSpace(base))
+	base = strings.TrimSpace(base)
 	if base == "" {
 		return nil, fmt.Errorf("base is required")
 	}
 	if market != models.Spot && market != models.Futures {
 		return nil, fmt.Errorf("market must be SPOT or FUTURES")
 	}
-	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	symbol = strings.TrimSpace(symbol)
 	if symbol == "" {
 		return nil, fmt.Errorf("symbol is required")
 	}
 	// Refuse desks the engine can never serve: the (symbol, market) pair must
-	// have an active order book, else every quote is rejected as unknown symbol.
-	tradable, err := s.store.SymbolTradable(ctx, symbol, string(market))
+	// have an active order book, else every quote is rejected as unknown
+	// symbol. The lookup also yields the engine's canonical spelling and its
+	// price/qty granularity — nothing here may upper-case the symbol itself,
+	// since engine symbols are case-sensitive and the non-crypto perps carry
+	// mixed-case tickers ("CrudeOIL-USDB", "AAPL.us-USDB").
+	spec, err := s.store.LookupSymbol(ctx, symbol, string(market))
 	if err != nil {
-		return nil, fmt.Errorf("check symbol: %w", err)
-	}
-	if !tradable {
 		return nil, fmt.Errorf("no active %s order book for %s — pick a listed market", market, symbol)
 	}
-	// Capture the engine's price/qty granularity so the strategy can snap quotes
-	// to it; unsnapped orders are rejected as "not a multiple of tick size".
-	tick, lot, err := s.store.SymbolRules(ctx, symbol, string(market))
-	if err != nil {
-		return nil, fmt.Errorf("load symbol rules: %w", err)
-	}
+	// Trust symbol_configs over the request for both spellings: the base is
+	// the engine's own base_currency, and the symbol is the exact string its
+	// order books are keyed by.
+	symbol, base = spec.Symbol, spec.Base
+	tick, lot := spec.Tick, spec.Lot
 	wallet := walletFor(base, market)
 	// The engine risk-locks this desk wallet by its literal id against Dex-
 	// Backend's user_balances, whose foreign key requires a matching users row.
@@ -112,6 +112,13 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	if lot.IsPositive() {
 		merged["_lotSize"] = lot.String()
 	}
+	// Pin the exact-case index ticker. The engine's base_currency IS the
+	// Price-Fetcher ticker for every listed market ("BTC", "EURUSD", "GOLD",
+	// "CrudeOIL", "AAPL.us"), so it addresses the Redis key directly. Without
+	// this the reader would fall back to deriving the base from the symbol,
+	// which upper-cases and so misses "price:CrudeOIL" / "price:AAPL.us"
+	// entirely — a desk that can never see a fresh index and never quotes.
+	merged["_indexTicker"] = base
 	delete(merged, "investment")
 
 	bot := &models.Bot{
@@ -150,9 +157,20 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 
 // legAsset resolves the logical leg name ("base" or "quote") to the concrete
 // asset symbol for this desk (e.g. "BTC" / "USDB").
+//
+// A FUTURES desk has no base leg at all: the engine margins its position in
+// the quote currency and never moves the base asset (see the futures
+// settlement handler, which only ever debits/credits the quote). Its base is
+// just the contract's underlying — for the non-crypto perps that's a ticker
+// like "GOLD" or "AAPL.us", which is not a holdable balance anywhere on the
+// exchange. Refuse the leg here with that explanation rather than letting the
+// request reach Dex-Backend and come back as a bare "unsupported asset".
 func legAsset(desk *models.MarketMaker, leg string) (string, error) {
 	switch leg {
 	case "base":
+		if desk.Market == models.Futures {
+			return "", fmt.Errorf("a FUTURES desk has no base leg — it margins in %s; fund the quote leg instead", collateralAsset(desk.Market))
+		}
 		return desk.Base, nil
 	case "quote":
 		return collateralAsset(desk.Market), nil
@@ -310,10 +328,15 @@ func (s *Service) Delete(ctx context.Context, deskID string) error {
 		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, collateralAsset(desk.Market), amt.String(), "debit")
 	}
 	_ = s.backend.ResetBalance(ctx, desk.WalletAddress, collateralAsset(desk.Market))
-	if amt, aerr := decimal.NewFromString(desk.BaseAmount); aerr == nil && amt.IsPositive() {
-		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, desk.Base, amt.String(), "debit")
+	// Base-leg teardown is SPOT-only, for the same reason Recredit skips it:
+	// a futures desk never held the base asset, and for a non-crypto perp that
+	// ticker isn't a Dex-Backend balance column at all.
+	if desk.Market == models.Spot {
+		if amt, aerr := decimal.NewFromString(desk.BaseAmount); aerr == nil && amt.IsPositive() {
+			_ = s.engine.LedgerSync(ctx, desk.WalletAddress, desk.Base, amt.String(), "debit")
+		}
+		_ = s.backend.ResetBalance(ctx, desk.WalletAddress, desk.Base)
 	}
-	_ = s.backend.ResetBalance(ctx, desk.WalletAddress, desk.Base)
 	if err := s.store.DeleteMM(ctx, deskID); err != nil {
 		return err
 	}
@@ -429,8 +452,17 @@ func (s *Service) Recredit(ctx context.Context) error {
 		if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, quoteAsset); err != nil {
 			return fmt.Errorf("release stale quote locks for %s: %w", desk.ID, err)
 		}
-		if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, desk.Base); err != nil {
-			return fmt.Errorf("release stale base locks for %s: %w", desk.ID, err)
+		// Only a SPOT desk holds the base asset; a futures desk margins
+		// entirely in the quote currency and has no base balance to have
+		// locked. Its Base is the contract's underlying ticker (e.g. "GOLD",
+		// "AAPL.us"), which isn't a balance column in Dex-Backend at all — asking
+		// it to release locks there fails "unsupported asset", and because this
+		// loop covers every desk, one futures desk on a non-crypto perp would
+		// otherwise block enabling for ALL desks.
+		if desk.Market == models.Spot {
+			if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, desk.Base); err != nil {
+				return fmt.Errorf("release stale base locks for %s: %w", desk.ID, err)
+			}
 		}
 		// investment (the strategy's bid-side quote budget) is the one field
 		// legitimately re-derived from quote_amount on every restart — it's

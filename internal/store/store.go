@@ -55,36 +55,46 @@ func (s *Store) migrate(ctx context.Context) error {
 	return err
 }
 
-// SymbolTradable reports whether the engine has an active order book for this
-// (symbol, market) pair. It reads symbol_configs — the same table the matching
-// engine loads its books from — so a desk can't be created against a market
-// that will never accept its orders.
-func (s *Store) SymbolTradable(ctx context.Context, symbol, market string) (bool, error) {
-	var ok bool
-	err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM symbol_configs
-			WHERE symbol = $1 AND market = $2 AND active = true
-		)`, symbol, market).Scan(&ok)
-	return ok, err
+// SymbolSpec is the engine's listing record for one (symbol, market) pair:
+// the canonical symbol spelling plus the granularity/base metadata a desk
+// needs to quote against it.
+type SymbolSpec struct {
+	// Symbol is the spelling stored in symbol_configs, which is what the
+	// engine keys its order books by. Callers must use this rather than
+	// whatever casing the request supplied.
+	Symbol string
+	Base   string
+	Tick   decimal.Decimal
+	Lot    decimal.Decimal
 }
 
-// SymbolRules returns the engine's tick_size and lot_size for a (symbol, market)
-// pair from symbol_configs — the price/qty granularity the matching engine
-// enforces. MM quotes must be snapped to these or the engine rejects them as
-// "not a multiple of tick size". Returns ErrMMNotFound-free zero values only on
-// query error; callers treat a zero tick/lot as "no rounding".
-func (s *Store) SymbolRules(ctx context.Context, symbol, market string) (tick, lot decimal.Decimal, err error) {
-	var t, l string
-	err = s.pool.QueryRow(ctx, `
-		SELECT tick_size, lot_size FROM symbol_configs
-		WHERE symbol = $1 AND market = $2 AND active = true`, symbol, market).Scan(&t, &l)
+// LookupSymbol resolves a (symbol, market) pair against symbol_configs — the
+// same table the matching engine loads its books from — so a desk can't be
+// created against a market that will never accept its orders. It also returns
+// the tick/lot granularity the engine enforces; MM quotes must be snapped to
+// these or they're rejected as "not a multiple of tick size".
+//
+// The symbol match is case-INSENSITIVE but the stored spelling is what comes
+// back. Engine symbols are case-sensitive and not all of them are upper-case:
+// the non-crypto perps carry Price-Fetcher's Live-Rates.com tickers verbatim
+// ("CrudeOIL-USDB", "AAPL.us-USDB"). Upper-casing a caller's input before the
+// lookup — as this path used to — turned those into "CRUDEOIL-USDB" /
+// "AAPL.US-USDB", which match no row, so every desk on those four markets was
+// refused as an unlisted market. Matching loosely and returning canonically
+// lets an admin type any casing and still get a desk wired to the real book.
+func (s *Store) LookupSymbol(ctx context.Context, symbol, market string) (SymbolSpec, error) {
+	var spec SymbolSpec
+	var tick, lot string
+	err := s.pool.QueryRow(ctx, `
+		SELECT symbol, base_currency, tick_size, lot_size FROM symbol_configs
+		WHERE lower(symbol) = lower($1) AND market = $2 AND active = true`,
+		symbol, market).Scan(&spec.Symbol, &spec.Base, &tick, &lot)
 	if err != nil {
-		return decimal.Zero, decimal.Zero, err
+		return SymbolSpec{}, err
 	}
-	tick, _ = decimal.NewFromString(t)
-	lot, _ = decimal.NewFromString(l)
-	return tick, lot, nil
+	spec.Tick, _ = decimal.NewFromString(tick)
+	spec.Lot, _ = decimal.NewFromString(lot)
+	return spec, nil
 }
 
 const schema = `
