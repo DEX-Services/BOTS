@@ -279,6 +279,15 @@ func (s *State) MaxDrawdown() decimal.Decimal {
 		}
 		if peak.IsPositive() {
 			dd := peak.Sub(v).Div(peak).Mul(decimal.NewFromInt(100))
+			// A leveraged desk can post equity below zero, which would
+			// otherwise make dd exceed 100% against a small early peak
+			// (e.g. a $10 peak followed by -$100 equity reads as 1100%
+			// drawdown). Drawdown is "how much of the peak was lost," so
+			// cap it at 100% — a full loss — rather than showing a
+			// nonsensical figure on the admin dashboard.
+			if dd.GreaterThan(decimal.NewFromInt(100)) {
+				dd = decimal.NewFromInt(100)
+			}
 			if dd.GreaterThan(mdd) {
 				mdd = dd
 			}

@@ -74,7 +74,7 @@ func NewStats() Stats {
 		ROI:           "0",
 		MaxDrawdownPct: "0",
 		BaseHeld:       "0",
-		AvgEntryPrice:  "0",
+		AvgEntryPrice:  "",
 	}
 }
 

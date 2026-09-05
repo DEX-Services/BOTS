@@ -476,7 +476,14 @@ func computeStats(s strategy.State, md marketdata.Snapshot, idx index.Snapshot, 
 	stats.Trades24h = s.Trades24h(now)
 	stats.MaxDrawdownPct = s.MaxDrawdown().String()
 	stats.BaseHeld = held.String()
-	stats.AvgEntryPrice = avg.String()
+	// market_maker never tracks a cost basis (see the doc comment above: its
+	// P/L is quantity-based, not mark-to-market), so s.AvgEntry is always
+	// the zero value here. Reporting that as "0" reads as "bought at price
+	// zero" on an admin dashboard even while the desk holds real inventory —
+	// leave it blank rather than assert a cost basis that was never tracked.
+	if bot.Strategy != "market_maker" {
+		stats.AvgEntryPrice = avg.String()
+	}
 	return stats
 }
 

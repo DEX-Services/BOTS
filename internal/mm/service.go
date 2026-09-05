@@ -292,8 +292,11 @@ func (s *Service) SetEnabled(ctx context.Context, deskID string, enabled bool) e
 	if enabled {
 		// A desk may be enabled after funding without a process restart.
 		// Reconcile the engine ledger against whatever base/quote it was
-		// actually funded with first.
-		if err := s.Recredit(ctx); err != nil {
+		// actually funded with first — just this desk (see recreditDesk's
+		// doc comment: a fleet-wide Recredit here made enabling one desk do
+		// O(desk count) network round-trips and could hang the request for
+		// tens of seconds on a platform with many desks).
+		if err := s.recreditDesk(ctx, desk); err != nil {
 			return fmt.Errorf("reconcile desk balances: %w", err)
 		}
 		if err := s.manager.Start(ctx, desk.BotID); err != nil {
@@ -447,31 +450,47 @@ func (s *Service) Recredit(ctx context.Context) error {
 		return err
 	}
 	for i := range desks {
-		desk := &desks[i]
-		quoteAsset := collateralAsset(desk.Market)
-		if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, quoteAsset); err != nil {
-			return fmt.Errorf("release stale quote locks for %s: %w", desk.ID, err)
+		if err := s.recreditDesk(ctx, &desks[i]); err != nil {
+			return err
 		}
-		// Only a SPOT desk holds the base asset; a futures desk margins
-		// entirely in the quote currency and has no base balance to have
-		// locked. Its Base is the contract's underlying ticker (e.g. "GOLD",
-		// "AAPL.us"), which isn't a balance column in Dex-Backend at all — asking
-		// it to release locks there fails "unsupported asset", and because this
-		// loop covers every desk, one futures desk on a non-crypto perp would
-		// otherwise block enabling for ALL desks.
-		if desk.Market == models.Spot {
-			if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, desk.Base); err != nil {
-				return fmt.Errorf("release stale base locks for %s: %w", desk.ID, err)
-			}
+	}
+	return nil
+}
+
+// recreditDesk does the reconcile work for exactly one desk. Split out of
+// Recredit so SetEnabled can reconcile just the desk being toggled instead of
+// every desk on the platform: SetEnabled used to call the fleet-wide Recredit
+// above on every single enable, meaning enabling one desk did up to 2
+// sequential HTTP round-trips to Dex-Backend PER DESK on the platform (34+
+// calls at 17 desks) before that one desk could start — under any real desk
+// count this either times out the request or, when several enables land
+// close together, serializes them behind each other's full fleet sweep badly
+// enough to make the API hang for tens of seconds with no response at all.
+// Recredit itself is kept for the one place a fleet-wide sweep is actually
+// correct: process boot, where every desk's locks need releasing at once
+// after a matching-engine restart wiped its in-memory reservations.
+func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) error {
+	quoteAsset := collateralAsset(desk.Market)
+	if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, quoteAsset); err != nil {
+		return fmt.Errorf("release stale quote locks for %s: %w", desk.ID, err)
+	}
+	// Only a SPOT desk holds the base asset; a futures desk margins
+	// entirely in the quote currency and has no base balance to have
+	// locked. Its Base is the contract's underlying ticker (e.g. "GOLD",
+	// "AAPL.us"), which isn't a balance column in Dex-Backend at all — asking
+	// it to release locks there fails "unsupported asset".
+	if desk.Market == models.Spot {
+		if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, desk.Base); err != nil {
+			return fmt.Errorf("release stale base locks for %s: %w", desk.ID, err)
 		}
-		// investment (the strategy's bid-side quote budget) is the one field
-		// legitimately re-derived from quote_amount on every restart — it's
-		// strategy config, not a balance, and always meant to track the
-		// desk's currently-funded quote leg.
-		if quoteAmt, err := decimal.NewFromString(desk.QuoteAmount); err == nil {
-			if err := s.store.UpdateInvestment(ctx, desk.BotID, quoteAmt.String()); err != nil {
-				return fmt.Errorf("sync bot investment for %s: %w", desk.ID, err)
-			}
+	}
+	// investment (the strategy's bid-side quote budget) is the one field
+	// legitimately re-derived from quote_amount on every restart — it's
+	// strategy config, not a balance, and always meant to track the
+	// desk's currently-funded quote leg.
+	if quoteAmt, err := decimal.NewFromString(desk.QuoteAmount); err == nil {
+		if err := s.store.UpdateInvestment(ctx, desk.BotID, quoteAmt.String()); err != nil {
+			return fmt.Errorf("sync bot investment for %s: %w", desk.ID, err)
 		}
 	}
 	return nil

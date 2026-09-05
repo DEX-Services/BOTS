@@ -245,6 +245,27 @@ func (m *marketMaker) drifted(mid decimal.Decimal) bool {
 
 // requote cancels all resting quotes and places a fresh ladder around mid.
 func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decimal, timestampMs int64) error {
+	// The engine rejects the WHOLE replacement ladder if any single level
+	// crosses the live book (ReplaceMarketMakerLadder is all-or-nothing by
+	// design — see its comment in matching-engine's reqReplaceAccountOrders —
+	// so a partial ladder is never installed by accident). mid can drift
+	// between when this tick sampled the index and when the request reaches
+	// the engine; under fast movement the tightest level (spreadBps, the
+	// smallest offset) is the one most likely to have been crossed by then.
+	// Previously that meant the desk went dark on BOTH sides until the next
+	// index publication happened to produce a wide-enough ladder — real gaps
+	// of zero liquidity were observed on live symbols under load. Retrying
+	// once with a wider spread clears a small amount of drift without
+	// touching the all-or-nothing safety net itself (a still-crossing wider
+	// ladder is correctly rejected again and the desk goes dark, same as
+	// before — this only recovers the common case of a near-miss).
+	return m.requoteWithSpread(ctx, deps, mid, timestampMs, m.spreadBps, true)
+}
+
+// requoteWithSpread builds and submits one ladder at the given half-spread.
+// allowRetry gates the single widen-and-retry pass described above, so the
+// retry attempt itself can't recurse.
+func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid decimal.Decimal, timestampMs int64, spreadBps decimal.Decimal, allowRetry bool) error {
 	held := dec(m.state.BaseHeld)
 	tenK := decimal.NewFromInt(10000)
 	numLevels := decimal.NewFromInt(int64(m.levels))
@@ -328,7 +349,7 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 
 	quotes := make([]engine.MarketMakerQuote, 0, m.levels*2)
 	for i := 0; i < m.levels; i++ {
-		offBps := m.spreadBps.Add(m.levelStepBps.Mul(decimal.NewFromInt(int64(i))))
+		offBps := spreadBps.Add(m.levelStepBps.Mul(decimal.NewFromInt(int64(i))))
 		off := offBps.Div(tenK)
 		bidPrice := m.snapPrice(mid.Mul(decimal.NewFromInt(1).Sub(off)), false)
 		askPrice := m.snapPrice(mid.Mul(decimal.NewFromInt(1).Add(off)), true)
@@ -363,6 +384,16 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 	}
 	resp, err := deps.Engine.ReplaceMarketMakerLadder(ctx, deps.Account, m.symbol, string(m.market), mid, timestampMs, quotes)
 	if err != nil {
+		// "did not rest" means mid drifted enough between sampling it and the
+		// engine processing this request that a level now crosses the live
+		// book; the engine correctly refused to install any partial ladder.
+		// One retry at double the spread recovers from ordinary drift without
+		// weakening that safety net — a level that still crosses at 2x spread
+		// is a real, larger move, and the second failure is left to the next
+		// tick exactly as before.
+		if allowRetry && strings.Contains(err.Error(), "did not rest") {
+			return m.requoteWithSpread(ctx, deps, mid, timestampMs, spreadBps.Mul(decimal.NewFromInt(2)), false)
+		}
 		return err
 	}
 	// A resting order can fill — fully or partially — in the instant before
