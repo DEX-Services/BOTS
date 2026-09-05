@@ -28,6 +28,15 @@ const persistInterval = 3 * time.Second
 // order rejected) instead of letting it retry indefinitely.
 const maxConsecutiveErrors = 10
 
+// Shutdown budget for StopAll. Stops run concurrently, so these bound the DB
+// writes and the slowest single worker's teardown rather than their sum; the
+// per-worker term keeps a large desk count from crowding out the tail.
+const (
+	stopAllBaseTimeout      = 10 * time.Second
+	stopAllPerWorkerTimeout = 2 * time.Second
+	stopAllMaxTimeout       = 60 * time.Second
+)
+
 // Manager owns all running bot workers.
 type Manager struct {
 	engine *engine.Client
@@ -49,19 +58,63 @@ func NewManager(engineClient *engine.Client, hub *marketdata.Hub, st *store.Stor
 	return &Manager{engine: engineClient, hub: hub, store: st, index: idx, workers: map[string]*worker{}, starting: map[string]struct{}{}}
 }
 
-// StartAll resumes every bot marked running in the database.
+// StartAll resumes every bot that should be running after a restart.
+//
+// Two sources, deliberately: bots whose own status column still says running
+// (any strategy — a user's TWAP/grid/DCA bot that was mid-run), plus every
+// market-maker desk whose enabled flag is set. The second source is what makes
+// a desk's resume survive a clean shutdown: StopAll marks the workers it stops
+// as stopped, so a status-only resume brings back exactly the desks that were
+// killed mid-flight and silently abandons the ones that exited properly —
+// leaving an admin-enabled desk dark with nothing in the log to say so. The
+// union is deduplicated (Start is a no-op on an already-running bot anyway, but
+// the set keeps the log count honest).
 func (m *Manager) StartAll(ctx context.Context) {
+	ids := make([]string, 0, 16)
+	seen := map[string]struct{}{}
+	add := func(id string) {
+		if _, dup := seen[id]; dup {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
 	bots, err := m.store.ListRunning(ctx)
 	if err != nil {
+		// Not fatal: the enabled-desk list below is an independent source, so
+		// market makers can still come back even if this query fails.
 		slog.Error("startup: list running bots failed", "error", err)
-		return
 	}
 	for i := range bots {
-		if err := m.Start(ctx, bots[i].ID); err != nil {
-			slog.Warn("startup: resume bot failed", "id", bots[i].ID, "error", err)
+		add(bots[i].ID)
+	}
+	deskBots, err := m.store.EnabledDesks(ctx)
+	if err != nil {
+		slog.Error("startup: list enabled market-maker desks failed", "error", err)
+	}
+	for _, d := range deskBots {
+		// A desk whose bot halted itself (10 consecutive tick errors) is left
+		// alone: that status means a real, persistent failure, and reviving it
+		// every boot would just crash-loop it and overwrite the recorded error
+		// with a fresh "running". Surface it instead so it's visible rather
+		// than quietly dark, and let an admin re-enable once it's fixed.
+		if d.Status == string(models.StatusError) {
+			slog.Warn("startup: enabled desk left stopped; its bot is in error state",
+				"bot", d.BotID, "symbol", d.Symbol)
+			continue
+		}
+		add(d.BotID)
+	}
+
+	var failed int
+	for _, id := range ids {
+		if err := m.Start(ctx, id); err != nil {
+			failed++
+			slog.Warn("startup: resume bot failed", "id", id, "error", err)
 		}
 	}
-	slog.Info("startup: resumed bots", "count", len(m.workers))
+	slog.Info("startup: resumed bots", "count", len(m.workers), "candidates", len(ids), "failed", failed)
 }
 
 // Start builds and runs a bot. Safe to call on an already-running bot.
@@ -161,6 +214,15 @@ func (m *Manager) Stop(ctx context.Context, botID string) error {
 }
 
 // StopAll gracefully stops every worker (used on shutdown).
+//
+// Workers stop concurrently, and the budget scales with how many there are.
+// Sequential stops sharing one flat 10s deadline did not survive the desk
+// count growing: each Stop waits on its worker's own shutdown, which cancels
+// that desk's resting quotes over HTTP, so the total ran past the deadline and
+// the tail of the list was cut off — those bots stayed marked running with
+// their quotes still on the book and their durable balance locks still held.
+// Stopping in parallel makes the wall clock the slowest single desk instead of
+// the sum of all of them.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
 	ids := make([]string, 0, len(m.workers))
@@ -168,11 +230,26 @@ func (m *Manager) StopAll() {
 		ids = append(ids, id)
 	}
 	m.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	for _, id := range ids {
-		_ = m.Stop(ctx, id)
+	if len(ids) == 0 {
+		return
 	}
+	budget := stopAllBaseTimeout + time.Duration(len(ids))*stopAllPerWorkerTimeout
+	if budget > stopAllMaxTimeout {
+		budget = stopAllMaxTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(botID string) {
+			defer wg.Done()
+			if err := m.Stop(ctx, botID); err != nil {
+				slog.Warn("shutdown: stop bot failed", "id", botID, "error", err)
+			}
+		}(id)
+	}
+	wg.Wait()
 }
 
 // IsRunning reports whether a bot currently has a live worker.

@@ -95,13 +95,13 @@ func main() {
 	// actual balances, which the engine's own startup backfill already primes
 	// correctly from the same Postgres row (see mm.Service.Recredit's doc).
 	//
-	// StartAll below unconditionally resumes any bot that was running before
-	// the restart, without going through the SetEnabled path that would
-	// otherwise retry Recredit on its own — so a desk resumed here can be left
-	// with stale locks if Recredit hasn't finished (e.g. a transient backend
-	// connection hiccup at boot) before it starts. Retry with a short backoff
-	// so a slow-to-connect dependency doesn't strand a desk in that state;
-	// only fall through with a warning (rather than block startup
+	// StartAll below resumes bots directly — any bot still marked running, plus
+	// every enabled market-maker desk — without going through the SetEnabled
+	// path that would otherwise retry Recredit on its own, so a desk resumed
+	// here can be left with stale locks if Recredit hasn't finished (e.g. a
+	// transient backend connection hiccup at boot) before it starts. Retry with
+	// a short backoff so a slow-to-connect dependency doesn't strand a desk in
+	// that state; only fall through with a warning (rather than block startup
 	// indefinitely) if it genuinely never comes up.
 	mmSvc := mm.NewService(st, engineClient, backendClient, manager)
 	recreditErr := mmSvc.Recredit(ctx)
@@ -120,7 +120,7 @@ func main() {
 	server := api.NewServer(st, manager, verifier, mmSvc)
 	handler := api.CORS(cfg.AllowedOrigins, server.Routes())
 
-	// Resume bots that were running before a restart.
+	// Resume bots that were running before a restart, plus every enabled desk.
 	manager.StartAll(ctx)
 
 	srv := &http.Server{

@@ -117,7 +117,46 @@ func (s *Store) DeleteMM(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListMM returns every desk, newest first.
+// EnabledDesk is one enabled market-maker desk and the current status of the
+// bot behind it, as needed to decide whether a restart should resume it.
+type EnabledDesk struct {
+	BotID  string
+	Symbol string
+	Status string
+}
+
+// EnabledDesks returns every desk whose enabled flag is set, with its bot's
+// status, regardless of what that status is.
+//
+// `enabled` on the desk is the admin's standing intent ("this desk should be
+// quoting"); bots.status is merely where the worker happened to be when the
+// process last exited. Those two diverge on every shutdown: StopAll marks each
+// worker it stops cleanly as stopped, so resuming from status alone silently
+// drops exactly the desks that shut down properly — they stay dark until an
+// admin re-toggles them by hand, with nothing logged. Startup reads intent from
+// here instead, and uses Status only to leave genuinely failed desks alone.
+// Ordered so the resume sequence is deterministic.
+func (s *Store) EnabledDesks(ctx context.Context) ([]EnabledDesk, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT mm.bot_id, mm.symbol, b.status
+		FROM market_makers mm
+		JOIN bots b ON b.id = mm.bot_id
+		WHERE mm.enabled = true
+		ORDER BY mm.created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []EnabledDesk{}
+	for rows.Next() {
+		var d EnabledDesk
+		if err := rows.Scan(&d.BotID, &d.Symbol, &d.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
 func (s *Store) ListMM(ctx context.Context) ([]models.MarketMaker, error) {
 	rows, err := s.pool.Query(ctx, mmSelect+` ORDER BY created_at DESC`)
 	if err != nil {
