@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -99,6 +100,45 @@ func (c *Client) ReleaseLocks(ctx context.Context, userID, asset string) error {
 		return fmt.Errorf("backend release-locks %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	return nil
+}
+
+// AvailableBalance reads userID's true Postgres available balance (total
+// minus locked) for asset via /internal/balance/available, in human units.
+// Used by recreditDesk to resync the matching engine's in-memory ledger to
+// what Postgres actually holds right now — not to a desk's tracked
+// quote_amount/base_amount, which only reflects admin deposits/withdrawals
+// and drifts from the real balance as trading P&L moves it (see
+// mm.Service.recreditDesk's comment for the failure this caused).
+func (c *Client) AvailableBalance(ctx context.Context, userID, asset string) (decimal.Decimal, error) {
+	if c.engineSecret == "" {
+		return decimal.Zero, fmt.Errorf("engine secret not configured; cannot read backend balance")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("%s/internal/balance/available?userId=%s&asset=%s", c.baseURL, url.QueryEscape(userID), url.QueryEscape(asset)), nil)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	req.Header.Set("X-Engine-Secret", c.engineSecret)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return decimal.Zero, fmt.Errorf("backend available-balance %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		Available string `json:"available"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return decimal.Zero, fmt.Errorf("decode available-balance response: %w", err)
+	}
+	amt, err := decimal.NewFromString(out.Available)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("invalid available-balance amount %q: %w", out.Available, err)
+	}
+	return amt, nil
 }
 
 // SyncBalance restores an internal desk wallet's durable balance to its

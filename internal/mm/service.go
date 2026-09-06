@@ -484,6 +484,48 @@ func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) er
 			return fmt.Errorf("release stale base locks for %s: %w", desk.ID, err)
 		}
 	}
+	// ReleaseLocks above only clears Postgres's locked column — it never
+	// touches the matching engine's in-memory ledger, which is what the MM
+	// strategy's own reservation checks and requotes actually run against.
+	// The engine's balance for this wallet was last set at ENGINE process
+	// boot (the startup backfill computes total - locked at that moment;
+	// see AllNonzeroBalances's doc comment in Dex-Backend), so it stays
+	// stuck at whatever it was then — even after this call frees up real
+	// capital in Postgres — until the engine itself restarts again. A desk
+	// enabled after that point (or toggled off/on, as an admin naturally
+	// does to apply a config change) kept quoting against a phantom-low
+	// balance forever: real capital sat unlocked in Postgres while every
+	// requote failed "insufficient <asset>" against the engine's stale
+	// figure, and each failed requote's own funding math made the reported
+	// "required" amount look like it kept growing across restarts, when
+	// what was actually happening was ReleaseLocks correctly freeing more
+	// each time while the engine-side balance never moved to match.
+	//
+	// Resync to Postgres's TRUE available balance (via AvailableBalance),
+	// not to desk.QuoteAmount/BaseAmount: those track admin deposits and
+	// withdrawals only, never trading P&L, so a desk running for a while
+	// can have a real balance below (realized losses) or above (realized
+	// gains) its originally-funded figure. Trusting QuoteAmount here set
+	// the engine's balance to a number Postgres itself could not back —
+	// the very next requote's own lock request against Postgres then failed
+	// "insufficient <asset> balance to lock" for EVERY desk, not just the
+	// underfunded ones, since it demanded more than genuinely exists.
+	if avail, err := s.backend.AvailableBalance(ctx, desk.WalletAddress, quoteAsset); err == nil {
+		if err := s.resyncEngineBalance(ctx, desk.WalletAddress, quoteAsset, avail); err != nil {
+			return fmt.Errorf("resync engine quote balance for %s: %w", desk.ID, err)
+		}
+	} else {
+		return fmt.Errorf("read true quote balance for %s: %w", desk.ID, err)
+	}
+	if desk.Market == models.Spot {
+		if avail, err := s.backend.AvailableBalance(ctx, desk.WalletAddress, desk.Base); err == nil {
+			if err := s.resyncEngineBalance(ctx, desk.WalletAddress, desk.Base, avail); err != nil {
+				return fmt.Errorf("resync engine base balance for %s: %w", desk.ID, err)
+			}
+		} else {
+			return fmt.Errorf("read true base balance for %s: %w", desk.ID, err)
+		}
+	}
 	// investment (the strategy's bid-side quote budget) is the one field
 	// legitimately re-derived from quote_amount on every restart — it's
 	// strategy config, not a balance, and always meant to track the
@@ -494,4 +536,22 @@ func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) er
 		}
 	}
 	return nil
+}
+
+// resyncEngineBalance brings the engine's in-memory balance for wallet/asset
+// up (or down) to target (Postgres's true available balance for that leg,
+// per AvailableBalance) by crediting/debiting exactly the difference.
+func (s *Service) resyncEngineBalance(ctx context.Context, wallet, asset string, target decimal.Decimal) error {
+	current, err := s.engine.Balance(ctx, wallet, asset)
+	if err != nil {
+		return fmt.Errorf("read engine balance: %w", err)
+	}
+	delta := target.Sub(current.Balance)
+	if delta.IsZero() {
+		return nil
+	}
+	if delta.IsPositive() {
+		return s.engine.LedgerSync(ctx, wallet, asset, delta.String(), "credit")
+	}
+	return s.engine.LedgerSync(ctx, wallet, asset, delta.Neg().String(), "debit")
 }
