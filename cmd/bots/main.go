@@ -120,9 +120,6 @@ func main() {
 	server := api.NewServer(st, manager, verifier, mmSvc)
 	handler := api.CORS(cfg.AllowedOrigins, server.Routes())
 
-	// Resume bots that were running before a restart, plus every enabled desk.
-	manager.StartAll(ctx)
-
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      handler,
@@ -136,6 +133,18 @@ func main() {
 			slog.Error("http server", "error", err)
 		}
 	}()
+
+	// Resume bots that were running before a restart, plus every enabled
+	// desk. Each resumed desk does real per-desk engine/backend work (see
+	// recreditDesk), and at platform scale (dozens of desks) that easily
+	// takes tens of seconds — long enough that running it before the port
+	// opens made run.sh's own health check (a 45s poll of this port) time
+	// out and report bots as down when it was actually still starting up
+	// correctly, just slowly. The port now opens immediately so health
+	// checks and readiness probes succeed right away; StartAll continues in
+	// the background and desks come online as each one finishes resuming,
+	// same as it always could mid-runtime via a manual enable.
+	go manager.StartAll(ctx)
 
 	<-ctx.Done()
 	slog.Info("shutting down; stopping bots")
