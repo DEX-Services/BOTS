@@ -15,6 +15,7 @@ package mm
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/dex/bots/internal/backend"
@@ -510,20 +511,31 @@ func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) er
 	// the very next requote's own lock request against Postgres then failed
 	// "insufficient <asset> balance to lock" for EVERY desk, not just the
 	// underfunded ones, since it demanded more than genuinely exists.
+	//
+	// Best-effort, not fatal: this adds 2-4 extra Dex-Backend round-trips
+	// per desk on top of ReleaseLocks above, and under real infra latency
+	// (a slow/contended Aiven Postgres — observed directly: a single lock
+	// round-trip took 9-11s at one point) doing this for many desks at once
+	// (e.g. every desk on process boot, via StartAll) can queue badly enough
+	// to make every desk's startup time out, which is worse than the stale
+	// balance this exists to fix. A failure here is logged and skipped
+	// rather than aborting SetEnabled/Start — the desk still starts, at
+	// worst with the same staleness that existed before this resync was
+	// added, which is the pre-existing (imperfect but working) behavior.
 	if avail, err := s.backend.AvailableBalance(ctx, desk.WalletAddress, quoteAsset); err == nil {
 		if err := s.resyncEngineBalance(ctx, desk.WalletAddress, quoteAsset, avail); err != nil {
-			return fmt.Errorf("resync engine quote balance for %s: %w", desk.ID, err)
+			slog.Warn("resync engine quote balance failed; desk starting with possibly-stale balance", "desk", desk.ID, "error", err)
 		}
 	} else {
-		return fmt.Errorf("read true quote balance for %s: %w", desk.ID, err)
+		slog.Warn("read true quote balance failed; desk starting with possibly-stale balance", "desk", desk.ID, "error", err)
 	}
 	if desk.Market == models.Spot {
 		if avail, err := s.backend.AvailableBalance(ctx, desk.WalletAddress, desk.Base); err == nil {
 			if err := s.resyncEngineBalance(ctx, desk.WalletAddress, desk.Base, avail); err != nil {
-				return fmt.Errorf("resync engine base balance for %s: %w", desk.ID, err)
+				slog.Warn("resync engine base balance failed; desk starting with possibly-stale balance", "desk", desk.ID, "error", err)
 			}
 		} else {
-			return fmt.Errorf("read true base balance for %s: %w", desk.ID, err)
+			slog.Warn("read true base balance failed; desk starting with possibly-stale balance", "desk", desk.ID, "error", err)
 		}
 	}
 	// investment (the strategy's bid-side quote budget) is the one field
