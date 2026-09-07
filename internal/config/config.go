@@ -37,7 +37,7 @@ type Config struct {
 // Load reads configuration from environment variables (and .env if present).
 func Load() (Config, error) {
 	c := Config{
-		Port:              getenv("BOTS_PORT", "8082"),
+		Port:              getenv("PORT", getenv("BOTS_PORT", "8082")),
 		JWTSecret:        os.Getenv("JWT_SECRET"),
 		EngineURL:        getenv("ENGINE_URL", "http://localhost:8080"),
 		BackendURL:       getenv("BACKEND_URL", "http://localhost:8081"),

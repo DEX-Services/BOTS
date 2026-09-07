@@ -50,6 +50,11 @@ func New(ctx context.Context, uri string) (*Store, error) {
 	return s, nil
 }
 
+// Ping checks the Postgres connection is alive, for health checks.
+func (s *Store) Ping(ctx context.Context) error {
+	return s.pool.Ping(ctx)
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, schema)
 	return err

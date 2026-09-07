@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dex/bots/internal/auth"
 	"github.com/dex/bots/internal/mm"
@@ -31,6 +33,8 @@ func NewServer(st *store.Store, mgr *runtime.Manager, v *auth.Verifier, mmSvc *m
 // requires a valid dex_session JWT.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /healthz", methodGuard(http.MethodGet, s.handleHealthz))
 
 	mux.HandleFunc("GET /bots/templates", methodGuard(http.MethodGet, s.handleTemplates))
 	mux.HandleFunc("GET /bots/marketplace", methodGuard(http.MethodGet, s.handleMarketplace))
@@ -95,6 +99,16 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // ----- public -----
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if err := s.store.Ping(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unhealthy"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
 
 func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"templates": strategy.Templates()})
