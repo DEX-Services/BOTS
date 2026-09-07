@@ -5,7 +5,7 @@
 //
 // Funding is admin-attested and per-leg: the admin moves real assets into the
 // treasury wallet off-platform — the actual base asset (BTC, ETH, ...) AND the
-// actual quote asset (USDB for both spot and futures) — then records each
+// actual quote asset (BIUSD for both spot and futures) — then records each
 // amount here separately. Neither leg is derived from the other by any
 // formula; a desk only ever holds what it was explicitly funded with.
 // Deposits credit the engine ledger so the bot can quote against it;
@@ -28,13 +28,13 @@ import (
 )
 
 // collateralAsset returns the currency required by the desk's market. Every
-// market — spot and futures alike — quotes and collateralizes in USDB, the
+// market — spot and futures alike — quotes and collateralizes in BIUSD, the
 // platform's internal stable currency; futures collateral used to be real
-// USDC, now converts to/settles in USDB like everything else on the
+// USDC, now converts to/settles in BIUSD like everything else on the
 // exchange. This is the desk's quote-leg asset; the base-leg asset is always
 // desk.Base.
 func collateralAsset(market models.Market) string {
-	return "USDB"
+	return "BIUSD"
 }
 
 // Service orchestrates market-maker desks: creation, funding, and start/stop.
@@ -78,7 +78,7 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	// symbol. The lookup also yields the engine's canonical spelling and its
 	// price/qty granularity — nothing here may upper-case the symbol itself,
 	// since engine symbols are case-sensitive and the non-crypto perps carry
-	// mixed-case tickers ("CrudeOIL-USDB", "AAPL.us-USDB").
+	// mixed-case tickers ("CrudeOIL-BIUSD", "AAPL.us-BIUSD").
 	spec, err := s.store.LookupSymbol(ctx, symbol, string(market))
 	if err != nil {
 		return nil, fmt.Errorf("no active %s order book for %s — pick a listed market", market, symbol)
@@ -157,7 +157,7 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 }
 
 // legAsset resolves the logical leg name ("base" or "quote") to the concrete
-// asset symbol for this desk (e.g. "BTC" / "USDB").
+// asset symbol for this desk (e.g. "BTC" / "BIUSD").
 //
 // A FUTURES desk has no base leg at all: the engine margins its position in
 // the quote currency and never moves the base asset (see the futures

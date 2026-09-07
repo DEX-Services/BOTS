@@ -56,7 +56,7 @@ type marketMaker struct {
 
 func mmParams() []models.TemplateParam {
 	return []models.TemplateParam{
-		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-USDB", Help: "e.g. BTC-USDB"},
+		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-BIUSD", Help: "e.g. BTC-BIUSD"},
 		{Key: "investment", Label: "Investment (quote)", Type: "number", Required: true, Default: "10000", Help: "Total quote budget backing the quotes"},
 		{Key: "spreadBps", Label: "Half-Spread (bps)", Type: "number", Required: true, Default: "10", Help: "Distance of the innermost quote from index, in basis points"},
 		{Key: "levels", Label: "Levels Per Side", Type: "number", Required: true, Default: "5", Help: "How many ladder levels on each side"},
@@ -142,11 +142,11 @@ func newMarketMaker(bot *models.Bot) (Strategy, error) {
 	}, nil
 }
 
-// quoteAsset returns the desk's quote-leg currency: USDB for every market,
+// quoteAsset returns the desk's quote-leg currency: BIUSD for every market,
 // spot and futures alike. Mirrors mm.collateralAsset (a different package,
 // same rule) since the strategy needs to read its own quote-asset balance too.
 func quoteAsset(market models.Market) string {
-	return "USDB"
+	return "BIUSD"
 }
 
 // decConfig parses a decimal config key, returning zero when absent or invalid.
@@ -284,7 +284,7 @@ func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid deci
 	// ladder asked the engine to reserve.
 	//
 	// Spot does NOT have this problem: its BUY side draws from quote_amount
-	// (USDB/USDT) and its SELL side is capped by actual held BASE inventory
+	// (BIUSD/USDT) and its SELL side is capped by actual held BASE inventory
 	// (see sellPerLevel below) — two independent currencies/pools, so the
 	// full investment is correctly available to size the buy side alone.
 	perLevel := m.investment.Div(numLevels)

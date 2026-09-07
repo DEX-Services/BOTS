@@ -326,10 +326,10 @@ func (m *Manager) remove(w *worker) {
 // indexSnapshot returns the current index-price snapshot for a symbol's base
 // asset, or a zero (stale) snapshot when no index reader is configured. A bot
 // config may pin the exact Redis ticker via "_indexTicker" — needed when the
-// real key's casing doesn't survive baseAsset's uppercasing ("CrudeOIL-USDB"
-// -> "CRUDEOIL", "AAPL.us-USDB" -> "AAPL.US", neither of which is a key
+// real key's casing doesn't survive baseAsset's uppercasing ("CrudeOIL-BIUSD"
+// -> "CRUDEOIL", "AAPL.us-BIUSD" -> "AAPL.US", neither of which is a key
 // Price-Fetcher ever writes). Without that override the lookup falls back to
-// the pair-derived base asset ("BTC-USDB" -> "BTC").
+// the pair-derived base asset ("BTC-BIUSD" -> "BTC").
 func (m *Manager) indexSnapshot(ctx context.Context, symbol string, cfg map[string]string) index.Snapshot {
 	if m.index == nil {
 		return index.Snapshot{}
