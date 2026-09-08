@@ -365,23 +365,52 @@ type worker struct {
 	// consecutiveErrors counts back-to-back OnTick failures; reset on success.
 	consecutiveErrors int
 	// fillCh delivers pushed order-lifecycle events routed from the shared
-	// engine WS connection (see Manager.routeFillEvent), consumed only by
-	// this worker's own run() loop so a FillEventHandler strategy's
-	// ApplyFillEvent never races OnTick/Init/OnStop. Buffered: a burst of
-	// fills across a desk's whole ladder landing in the same instant (a fast
-	// market move sweeping several levels) should queue rather than block
-	// the WS client's single read goroutine, which serves every desk.
+	// engine WS connection (see Manager.routeFillEvent). Drained by its own
+	// goroutine (see run()'s "goroutine 2" below), NOT the tick loop — an
+	// earlier version routed this through the same select as OnTick's timer,
+	// which meant a slow/hung engine HTTP call inside one tick blocked fill
+	// delivery for up to that call's whole timeout, and a burst of real fills
+	// arriving during that window could overflow this buffer and get
+	// silently dropped (observed live: "engine ws: dropped fill event,
+	// worker not draining" firing repeatedly while a stuck requote retried).
+	// Buffered: a burst of fills across a desk's whole ladder landing in the
+	// same instant (a fast market move sweeping several levels) should queue
+	// rather than block the WS client's single read goroutine, which serves
+	// every desk.
 	fillCh chan strategy.FillEvent
-	// reconcileCh requests one ReconcileOpenOrders pass on the next loop
-	// iteration — signaled on Start (the initial connection) and on every
-	// subsequent engine WS reconnect (see Manager.reconcileAll). Buffered 1:
-	// coalescing is correct here, a second signal before the first is
-	// serviced doesn't need a second pass.
+	// reconcileCh requests one ReconcileOpenOrders pass — signaled on Start
+	// (the initial connection) and on every subsequent engine WS reconnect
+	// (see Manager.reconcileAll). Also drained by the fill-event goroutine,
+	// for the same reason. Buffered 1: coalescing is correct here, a second
+	// signal before the first is serviced doesn't need a second pass.
 	reconcileCh chan struct{}
 }
 
 func (w *worker) run() {
 	defer close(w.doneCh)
+	// goroutine 2: drains fillCh/reconcileCh independently of the tick loop
+	// below, so a slow/hung engine HTTP call inside one tick can never starve
+	// fill-event delivery (see fillCh's doc comment on worker). Stops via
+	// fillDrainDoneCh once stopCh fires, mirroring the tick loop's own exit —
+	// both goroutines share w.stateMu, so run() can safely wait for this one
+	// to actually stop (not just be told to) before shutdown() takes its own
+	// final strategy call.
+	fillDrainDoneCh := make(chan struct{})
+	go func() {
+		defer close(fillDrainDoneCh)
+		ctx := context.Background()
+		for {
+			select {
+			case <-w.stopCh:
+				return
+			case evt := <-w.fillCh:
+				w.applyFillEvent(ctx, evt)
+			case <-w.reconcileCh:
+				w.reconcile(ctx)
+			}
+		}
+	}()
+
 	persist := time.NewTicker(persistInterval)
 	defer persist.Stop()
 	// The external index is updated independently from the engine's trade
@@ -393,10 +422,12 @@ func (w *worker) run() {
 	for {
 		select {
 		case <-w.stopCh:
+			<-fillDrainDoneCh // wait for the other goroutine before this one's final strategy call
 			w.shutdown(ctx)
 			return
 		case <-w.wakeCh:
 			if halted := w.tick(ctx); halted {
+				<-fillDrainDoneCh
 				w.shutdown(ctx)
 				go w.manager.remove(w) // detach off the worker goroutine; Stop would deadlock here
 				return
@@ -404,15 +435,12 @@ func (w *worker) run() {
 		case <-indexTick.C:
 			if w.bot.Strategy == "market_maker" {
 				if halted := w.tick(ctx); halted {
+					<-fillDrainDoneCh
 					w.shutdown(ctx)
 					go w.manager.remove(w)
 					return
 				}
 			}
-		case evt := <-w.fillCh:
-			w.applyFillEvent(ctx, evt)
-		case <-w.reconcileCh:
-			w.reconcile(ctx)
 		case <-persist.C:
 			w.persist(ctx)
 		}
@@ -421,8 +449,13 @@ func (w *worker) run() {
 
 // applyFillEvent hands one pushed fill notification to the strategy if it
 // implements FillEventHandler, using the same Deps a normal tick would build.
-// Runs only from this worker's own loop (see fillCh's doc comment), so it's
-// safe to mutate strategy state without additional locking.
+// Runs on the dedicated fill-drain goroutine (see fillCh's doc comment on
+// worker), concurrently with OnTick on the tick goroutine — FillEventHandler
+// implementations are responsible for their own internal locking around
+// state access (see marketMaker's stateMu), scoped tightly enough that it's
+// never held for the duration of an engine HTTP call. A worker-level mutex
+// around the whole call would just reintroduce the same starvation this
+// split was meant to fix, via lock contention instead of channel blocking.
 func (w *worker) applyFillEvent(ctx context.Context, evt strategy.FillEvent) {
 	fh, ok := w.strategy.(strategy.FillEventHandler)
 	if !ok {
@@ -436,7 +469,8 @@ func (w *worker) applyFillEvent(ctx context.Context, evt strategy.FillEvent) {
 
 // reconcile runs the strategy's full open-orders reconciliation pass if it
 // implements FillEventHandler — see ReconcileOpenOrders' doc comment for why
-// this is the only place that kind of poll still happens.
+// this is the only place that kind of poll still happens. Runs on the
+// dedicated fill-drain goroutine; see applyFillEvent's locking note.
 func (w *worker) reconcile(ctx context.Context) {
 	fh, ok := w.strategy.(strategy.FillEventHandler)
 	if !ok {

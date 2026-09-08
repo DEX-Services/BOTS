@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dex/bots/internal/engine"
@@ -29,6 +30,17 @@ var defaultMinSpreadBps = decimal.NewFromInt(10)
 // threshold; (3) detects fills of its resting quotes and accounts inventory
 // with the shared avg-cost helpers.
 type marketMaker struct {
+	// mu guards state/lastMid/lastIndexTimestampMs. Two goroutines call into
+	// this strategy now (see runtime.worker's fillCh doc comment): the tick
+	// loop (OnTick) and a dedicated fill-drain goroutine (ApplyFillEvent,
+	// ReconcileOpenOrders) — split specifically so a slow engine HTTP call in
+	// one never blocks the other from delivering pushed fill events. That
+	// split only holds if this mutex is NEVER held across a network call:
+	// requoteWithSpread locks to read state building the request, releases
+	// it for the ReplaceMarketMakerLadder round trip, then re-locks briefly
+	// to apply the response. ApplyFillEvent/ReconcileOpenOrders do no network
+	// I/O themselves, so locking their whole body is fine and simplest.
+	mu           sync.Mutex
 	state        *State
 	symbol       string
 	base         string
@@ -224,15 +236,25 @@ func (m *marketMaker) OnTick(ctx context.Context, deps Deps) error {
 	// prior behavior here) turns normal price noise into a full ladder
 	// replacement every second for no benefit.
 	if idx.TimestampMs > 0 && idx.TimestampMs != m.lastIndexTimestampMs {
-		if len(m.state.OpenOrders) == 0 || m.drifted(mid) {
-			if err := m.requote(ctx, deps, mid, idx.TimestampMs); err != nil {
-				slog.Warn("mm requote failed", "symbol", m.symbol, "error", err)
-			}
-		} else {
+		// Decide under a brief lock (see mu's doc comment), then release it
+		// before requote's HTTP round trip — never call requote while holding
+		// mu, or a slow engine response blocks ApplyFillEvent/
+		// ReconcileOpenOrders on the other goroutine exactly as this split
+		// was meant to prevent.
+		m.mu.Lock()
+		noOpenOrders := len(m.state.OpenOrders) == 0
+		needsRequote := noOpenOrders || m.drifted(mid)
+		if !needsRequote {
 			// Price hasn't moved enough to justify a replace; still record
 			// that we've seen this index publication so drift is measured
 			// from a fresh baseline next time, not against a stale one.
 			m.lastIndexTimestampMs = idx.TimestampMs
+		}
+		m.mu.Unlock()
+		if needsRequote {
+			if err := m.requote(ctx, deps, mid, idx.TimestampMs); err != nil {
+				slog.Warn("mm requote failed", "symbol", m.symbol, "error", err)
+			}
 		}
 	}
 	m.sampleEquity(mid)
@@ -243,7 +265,15 @@ func (m *marketMaker) OnStop(ctx context.Context, deps Deps) error {
 	return m.cancelWalletQuotes(ctx, deps)
 }
 
-func (m *marketMaker) Snapshot() State { return *m.state }
+// Snapshot is called by persist() on the tick goroutine and can race a live
+// desk's fill-drain goroutine mutating *m.state — locked for that reason.
+// Restore is only ever called before the worker's goroutines start (see
+// runtime.Manager.Start), so it needs no lock.
+func (m *marketMaker) Snapshot() State {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return *m.state
+}
 func (m *marketMaker) Restore(s State) { m.state = &s }
 
 // drifted reports whether the index has moved from the last quote mid by more
@@ -279,7 +309,9 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 // allowRetry gates the single widen-and-retry pass described above, so the
 // retry attempt itself can't recurse.
 func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid decimal.Decimal, timestampMs int64, spreadBps decimal.Decimal, allowRetry bool) error {
+	m.mu.Lock()
 	held := dec(m.state.BaseHeld)
+	m.mu.Unlock()
 	tenK := decimal.NewFromInt(10000)
 	numLevels := decimal.NewFromInt(int64(m.levels))
 	// Per-level quote notional: split the budget evenly across all levels/side.
@@ -418,6 +450,13 @@ func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid deci
 	// strategy's BaseHeld never catches up, and every later requote asks the
 	// engine to lock more than is actually left (see engine's MMReplaceResponse
 	// doc comment).
+	//
+	// Locked from here on: everything below only touches m.state/m.lastMid/
+	// m.lastIndexTimestampMs, no more network I/O, so holding the lock for
+	// the rest of this function cannot starve ApplyFillEvent/
+	// ReconcileOpenOrders on the other goroutine (see mu's doc comment).
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, o := range resp.Removed {
 		ref, ok := m.state.OpenOrders[o.ID]
 		if !ok {
@@ -488,6 +527,10 @@ func (m *marketMaker) cancelAll(ctx context.Context, deps Deps) error {
 	if err != nil {
 		return err
 	}
+	// Locked from here: no more network I/O below (see requoteWithSpread's mu
+	// doc comment for why that split matters).
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	// Same reconciliation requote does: a resting order can fill in the
 	// instant before this same call cancels it, and Removed is the only
 	// place that fill's true final state ever surfaces (see requote's
@@ -544,40 +587,87 @@ func (m *marketMaker) ReconcileOpenOrders(ctx context.Context, deps Deps) error 
 			resting[o.ID] = o.Filled
 		}
 	}
+
+	// Snapshot the tracked-order map under lock (never range a shared map
+	// while unlocked — OnTick's requoteWithSpread/cancelAll can mutate it
+	// from the other goroutine between iterations otherwise). The perOrder
+	// OrderStatusByID lookups below are network calls, so they must run
+	// unlocked — same reasoning as requoteWithSpread's split (see mu's doc
+	// comment) — which is exactly why this snapshot-then-apply shape is
+	// needed instead of locking the whole loop.
+	m.mu.Lock()
+	tracked := make(map[string]OrderRef, len(m.state.OpenOrders))
 	for id, ref := range m.state.OpenOrders {
+		tracked[id] = ref
+	}
+	m.mu.Unlock()
+
+	type update struct {
+		id      string
+		ref     OrderRef // zero value + remove=true means "delete this id"
+		remove  bool
+		fillQty decimal.Decimal
+		price   decimal.Decimal
+	}
+	var updates []update
+	for id, ref := range tracked {
 		price := dec(ref.Price)
 		if filledStr, ok := resting[id]; ok {
-			// Still on the book: account any partial fill that has accrued while
-			// it rests, but keep tracking it.
+			// Still on the book: account any partial fill that has accrued
+			// while it rests, but keep tracking it.
 			r := ref
-			delta := m.state.applyFillDelta(&r, dec(filledStr), price)
-			if delta.IsPositive() {
-				m.applyQuoteDelta(r.Side, delta, price)
-				m.state.recordTrade(deps.MD.UpdatedAt)
-			}
-			m.state.OpenOrders[id] = r
+			updates = append(updates, update{id: id, ref: r, fillQty: dec(filledStr), price: price})
 			continue
 		}
 		// Left the book: resolve its true terminal state before accounting.
 		st, err := deps.Engine.OrderStatusByID(ctx, m.symbol, string(m.market), id)
 		if err != nil {
 			// Transient lookup failure — leave the order tracked and retry next
-			// tick rather than guess.
+			// pass rather than guess.
 			slog.Warn("mm order-status lookup failed", "symbol", m.symbol, "order", id, "error", err)
 			continue
 		}
 		if !st.Found {
 			// Not yet in the durable record (async writer lag). Keep tracking;
-			// it will resolve on a later tick.
+			// it will resolve on a later pass.
 			continue
 		}
-		r := ref
-		delta := m.state.applyFillDelta(&r, dec(st.Filled), price)
+		updates = append(updates, update{id: id, ref: ref, remove: true, fillQty: dec(st.Filled), price: price})
+	}
+
+	// Apply everything gathered above in one locked pass. A concurrent
+	// ApplyFillEvent/second ReconcileOpenOrders call can't happen — both run
+	// on the same dedicated fill-drain goroutine, sequentially (see
+	// runtime.worker) — but requoteWithSpread/cancelAll on the tick
+	// goroutine could still be mutating m.state.OpenOrders right up until
+	// this locks, so re-check "is this order still tracked, and does its
+	// AppliedFilled watermark still match what we snapshotted" before
+	// applying — a requote that already tore this exact order down (and
+	// accounted its fill via resp.Removed) must not be double-counted here.
+	if len(updates) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, u := range updates {
+		current, stillTracked := m.state.OpenOrders[u.id]
+		if !stillTracked || current.AppliedFilled != u.ref.AppliedFilled {
+			// Already resolved by the tick goroutine in the meantime (e.g. a
+			// requote's resp.Removed already accounted this order's fill and
+			// removed it) — applying this stale snapshot would double-count.
+			continue
+		}
+		r := current
+		delta := m.state.applyFillDelta(&r, u.fillQty, u.price)
 		if delta.IsPositive() {
-			m.applyQuoteDelta(r.Side, delta, price)
+			m.applyQuoteDelta(r.Side, delta, u.price)
 			m.state.recordTrade(deps.MD.UpdatedAt)
 		}
-		delete(m.state.OpenOrders, id)
+		if u.remove {
+			delete(m.state.OpenOrders, u.id)
+		} else {
+			m.state.OpenOrders[u.id] = r
+		}
 	}
 	return nil
 }
@@ -588,6 +678,12 @@ func (m *marketMaker) ReconcileOpenOrders(ctx context.Context, deps Deps) error 
 // (already reconciled away, or never ours) rather than erroring, since the
 // stream is a superfluous-notification-tolerant push, not a strict RPC.
 func (m *marketMaker) ApplyFillEvent(ctx context.Context, deps Deps, evt FillEvent) error {
+	// No network I/O here, so a single lock around the whole body is
+	// correct and simplest — unlike requoteWithSpread/ReconcileOpenOrders,
+	// there's no HTTP call in the middle to worry about blocking the other
+	// goroutine during (see mu's doc comment).
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	ref, ok := m.state.OpenOrders[evt.OrderID]
 	if !ok {
 		return nil
@@ -638,6 +734,8 @@ func (m *marketMaker) applyQuoteDelta(side string, qty, price decimal.Decimal) {
 // number alongside the quote-asset delta — a real price move with unchanged
 // holdings contributes exactly zero, unlike the old mark-to-market model.
 func (m *marketMaker) sampleEquity(mid decimal.Decimal) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.state.pushEquity(time.Now(), m.netPnL(mid))
 }
 
