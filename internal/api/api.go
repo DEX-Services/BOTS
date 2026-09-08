@@ -2,8 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dex/bots/internal/auth"
 	"github.com/dex/bots/internal/mm"
@@ -39,6 +41,11 @@ func (s *Server) Routes() http.Handler {
 	// so the frontend header reads the same number the MM quotes and marks P/L
 	// against, instead of an independent Binance REST poll.
 	mux.HandleFunc("GET /index/{base}", methodGuard(http.MethodGet, s.handleIndex))
+	// Same data over Server-Sent Events at the price-fetcher's 1s cadence, so
+	// the frontend can drop its per-second GET /index/{base} polling. One
+	// stream per open tab replaces that tab's 1 req/s with a single pushed
+	// connection; the plain GET stays as the initial-load fallback.
+	mux.HandleFunc("GET /index/stream", methodGuard(http.MethodGet, s.handleIndexStream))
 
 	mux.HandleFunc("GET /bots", s.requireAuth(methodGuard(http.MethodGet, s.handleList)))
 	mux.HandleFunc("POST /bots", s.requireAuth(methodGuard(http.MethodPost, s.handleCreate)))
@@ -138,6 +145,71 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"low":           snap.Low24h,
 		"quoteVolume":   snap.QuoteVolume,
 	})
+}
+
+// handleIndexStream serves the same Redis-backed index snapshot as handleIndex
+// over Server-Sent Events: one "data:" frame per second (the price-fetcher's
+// publication cadence), for as long as the client keeps the connection open.
+// The frontend's useIndexPrice consumes this instead of re-GETting the REST
+// endpoint every second — the read happens once per second server-side no
+// matter how many tabs are watching, and each tab's marginal cost is one
+// buffered write.
+func (s *Server) handleIndexStream(w http.ResponseWriter, r *http.Request) {
+	// NOT upper-cased: same exact-ticker lookup as handleIndex (Live-Rates
+	// stock tickers keep their case-sensitive ".us" suffix in Redis keys).
+	base := strings.TrimSpace(r.URL.Query().Get("base"))
+	if base == "" {
+		writeErr(w, http.StatusBadRequest, "base required")
+		return
+	}
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	writeOne := func() bool {
+		snap := s.manager.IndexSnapshotExact(r.Context(), base)
+		payload, err := json.Marshal(map[string]any{
+			"base":          base,
+			"price":         snap.Price.String(),
+			"fresh":         snap.Fresh,
+			"ageMs":         snap.AgeMs,
+			"changePercent": snap.ChangePercent,
+			"high":          snap.High24h,
+			"low":           snap.Low24h,
+			"quoteVolume":   snap.QuoteVolume,
+		})
+		if err != nil {
+			return true // encoding a flat map cannot fail in practice; keep the stream alive
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+			return false // client disconnected
+		}
+		fl.Flush()
+		return true
+	}
+
+	// First frame immediately so the UI renders a price without waiting a
+	// full interval, then one frame per publication cycle.
+	if !writeOne() {
+		return
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if !writeOne() {
+				return
+			}
+		}
+	}
 }
 
 // ----- authed -----
