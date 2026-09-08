@@ -32,20 +32,12 @@ type Config struct {
 	// market-maker funding layer. Must match the engine's and Dex-Backend's
 	// DEX_BACKEND_ENGINE_SECRET / ENGINE_SHARED_SECRET. Empty ⇒ MM funding fails.
 	EngineSecret string
-
-	// WSInternalSecret authenticates bots' own /ws connection to the engine as
-	// trusted server-to-server traffic, separate from the browser Origin
-	// allowlist the engine also checks (see matching-engine's
-	// hasValidInternalSecret doc comment for why these are kept independent).
-	// Must match the engine's WS_INTERNAL_SECRET. Empty ⇒ the WS connection is
-	// rejected and market makers fall back to reconcile-only polling.
-	WSInternalSecret string
 }
 
 // Load reads configuration from environment variables (and .env if present).
 func Load() (Config, error) {
 	c := Config{
-		Port:              getenv("PORT", getenv("BOTS_PORT", "8082")),
+		Port:              getenv("BOTS_PORT", "8082"),
 		JWTSecret:        os.Getenv("JWT_SECRET"),
 		EngineURL:        getenv("ENGINE_URL", "http://localhost:8080"),
 		BackendURL:       getenv("BACKEND_URL", "http://localhost:8081"),
@@ -57,7 +49,6 @@ func Load() (Config, error) {
 		IndexPrefix:      getenv("INDEX_KEY_PREFIX", "price"),
 		IndexMaxAgeMs:    getenvInt("INDEX_MAX_AGE_MS", 5000),
 		EngineSecret:     os.Getenv("DEX_BACKEND_ENGINE_SECRET"),
-		WSInternalSecret: os.Getenv("WS_INTERNAL_SECRET"),
 	}
 	if c.JWTSecret == "" {
 		return c, fmt.Errorf("JWT_SECRET is required (must match Dex-Backend)")
