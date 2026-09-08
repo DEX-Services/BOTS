@@ -135,7 +135,7 @@ func newMarketMaker(bot *models.Bot) (Strategy, error) {
 	return &marketMaker{
 		state: newStatePtr(), symbol: bot.Symbol, base: baseAsset(bot.Symbol),
 		quoteAsset: quoteAsset(bot.Market),
-		market: bot.Market, investment: investment, spreadBps: spreadBps,
+		market:     bot.Market, investment: investment, spreadBps: spreadBps,
 		levels: levels, levelStepBps: stepBps, maxInventory: maxInv,
 		leverage: lev, marginMode: cfg(bot, "marginMode"), requoteBps: requoteBps,
 		tick: decConfig(bot, "_tickSize"), lot: decConfig(bot, "_lotSize"),
@@ -214,12 +214,25 @@ func (m *marketMaker) OnTick(ctx context.Context, deps Deps) error {
 		slog.Warn("mm fill-detect failed", "symbol", m.symbol, "error", err)
 	}
 
-	// 3. Every fresh external publication is a complete new quote set.  This
-	// deliberately does not use the engine midpoint or a drift threshold: the
-	// price-fetcher timestamp is the authoritative cadence.
-	if len(m.state.OpenOrders) == 0 || (idx.TimestampMs > 0 && idx.TimestampMs != m.lastIndexTimestampMs) {
-		if err := m.requote(ctx, deps, mid, idx.TimestampMs); err != nil {
-			slog.Warn("mm requote failed", "symbol", m.symbol, "error", err)
+	// 3. Requote only when it's actually warranted: no resting quotes yet, or
+	// the index has moved past requoteBps since our last quote mid. This is
+	// how real market makers behave — Binance/Bybit MMs don't re-issue quotes
+	// on every tick of a reference feed, they requote when the move is big
+	// enough to matter (or their own risk/inventory changes), because
+	// ReplaceMarketMakerLadder is a cancel-all+place-all round trip, not a
+	// cheap in-place amend. Requoting on every ~1s index publication (the
+	// prior behavior here) turns normal price noise into a full ladder
+	// replacement every second for no benefit.
+	if idx.TimestampMs > 0 && idx.TimestampMs != m.lastIndexTimestampMs {
+		if len(m.state.OpenOrders) == 0 || m.drifted(mid) {
+			if err := m.requote(ctx, deps, mid, idx.TimestampMs); err != nil {
+				slog.Warn("mm requote failed", "symbol", m.symbol, "error", err)
+			}
+		} else {
+			// Price hasn't moved enough to justify a replace; still record
+			// that we've seen this index publication so drift is measured
+			// from a fresh baseline next time, not against a stale one.
+			m.lastIndexTimestampMs = idx.TimestampMs
 		}
 	}
 	m.sampleEquity(mid)
