@@ -208,11 +208,11 @@ func (m *marketMaker) OnTick(ctx context.Context, deps Deps) error {
 	}
 	mid := idx.Price
 
-	// 2. Detect fills of our resting quotes first, so inventory is current
-	//    before we decide the next ladder.
-	if err := m.detectFills(ctx, deps); err != nil {
-		slog.Warn("mm fill-detect failed", "symbol", m.symbol, "error", err)
-	}
+	// 2. Fill detection is no longer polled here — the runtime pushes fills
+	// via ApplyFillEvent as the engine's WS stream reports them, so inventory
+	// is already current by the time any tick runs. See ReconcileOpenOrders'
+	// doc comment for where the equivalent full poll still happens (only
+	// right after a WS (re)connect, not every tick).
 
 	// 3. Requote only when it's actually warranted: no resting quotes yet, or
 	// the index has moved past requoteBps since our last quote mid. This is
@@ -516,15 +516,24 @@ func (m *marketMaker) cancelWalletQuotes(ctx context.Context, deps Deps) error {
 	return m.cancelAll(ctx, deps)
 }
 
-// detectFills reconciles tracked quotes against the engine's authoritative
-// order state and accounts only the real filled delta. A resting order that has
-// partially filled is picked up from the /orders "filled" field; an order that
-// has left the book is resolved via /order/status, which distinguishes a true
-// (possibly partial) fill from a self-trade-prevention cancel or an order lost
-// to an engine restart — both of which fill nothing. This replaces the old
-// "vanished ⇒ fully filled" assumption that fabricated PnL whenever the desk
-// requoted, self-crossed, or the engine restarted.
-func (m *marketMaker) detectFills(ctx context.Context, deps Deps) error {
+// ReconcileOpenOrders reconciles tracked quotes against the engine's
+// authoritative order state and accounts only the real filled delta. A
+// resting order that has partially filled is picked up from the /orders
+// "filled" field; an order that has left the book is resolved via
+// /order/status, which distinguishes a true (possibly partial) fill from a
+// self-trade-prevention cancel or an order lost to an engine restart — both
+// of which fill nothing. This replaces the old "vanished ⇒ fully filled"
+// assumption that fabricated PnL whenever the desk requoted, self-crossed, or
+// the engine restarted.
+//
+// This is the strategy.FillEventHandler reconciliation half: it used to run
+// on every OnTick (one GET /orders round trip per desk per second, forever —
+// the dominant source of steady-state egress for a running desk). It now
+// runs only right after the runtime's shared engine WS (re)connects, to catch
+// up on anything that happened during the gap; steady-state fill accounting
+// is pushed via ApplyFillEvent instead. Kept as a full poll (not incremental)
+// because a reconnect gap has no sequence-number bookmark to resume from.
+func (m *marketMaker) ReconcileOpenOrders(ctx context.Context, deps Deps) error {
 	open, err := deps.Engine.OpenOrders(ctx, deps.Account)
 	if err != nil {
 		return err
@@ -569,6 +578,39 @@ func (m *marketMaker) detectFills(ctx context.Context, deps Deps) error {
 			m.state.recordTrade(deps.MD.UpdatedAt)
 		}
 		delete(m.state.OpenOrders, id)
+	}
+	return nil
+}
+
+// ApplyFillEvent accounts one pushed order-lifecycle event from the engine's
+// WS stream — the steady-state replacement for polling ReconcileOpenOrders
+// every tick. Ignores events for orders this desk isn't currently tracking
+// (already reconciled away, or never ours) rather than erroring, since the
+// stream is a superfluous-notification-tolerant push, not a strict RPC.
+func (m *marketMaker) ApplyFillEvent(ctx context.Context, deps Deps, evt FillEvent) error {
+	ref, ok := m.state.OpenOrders[evt.OrderID]
+	if !ok {
+		return nil
+	}
+	price := dec(ref.Price)
+	filled := dec(evt.Filled)
+	delta := m.state.applyFillDelta(&ref, filled, price)
+	if delta.IsPositive() {
+		m.applyQuoteDelta(ref.Side, delta, price)
+		m.state.recordTrade(deps.MD.UpdatedAt)
+	}
+	switch evt.Status {
+	case "FILLED", "CANCELLED", "REJECTED", "EXPIRED":
+		// Terminal: no longer resting, stop tracking it. A CANCELLED or
+		// EXPIRED order may still carry a nonzero Filled (partial fill before
+		// it left the book) — applyFillDelta above already accounted that
+		// before this delete, same as ReconcileOpenOrders' "left the book"
+		// branch does via /order/status.
+		delete(m.state.OpenOrders, evt.OrderID)
+	default:
+		// Still resting (e.g. PARTIALLY_FILLED): keep tracking with the
+		// updated watermark.
+		m.state.OpenOrders[evt.OrderID] = ref
 	}
 	return nil
 }

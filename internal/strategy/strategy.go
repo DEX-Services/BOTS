@@ -46,6 +46,48 @@ type Strategy interface {
 	Restore(s State)
 }
 
+// FillEvent is a decoded order-lifecycle notification pushed from the
+// matching engine's /ws stream, already filtered by the runtime to this
+// bot's own account. See engine.WSEvent for the wire shape this is derived
+// from.
+type FillEvent struct {
+	OrderID string
+	// Status is the engine's OrderStatus string (e.g. "FILLED",
+	// "PARTIALLY_FILLED", "CANCELLED", "REJECTED", "EXPIRED").
+	Status string
+	// Filled is the order's cumulative filled quantity as of this event,
+	// decimal-string encoded exactly as the engine sends it.
+	Filled string
+}
+
+// FillEventHandler is implemented by strategies that can react to pushed
+// fill notifications instead of (or in addition to) polling for them on
+// every tick. The runtime type-asserts for this optionally — a strategy that
+// doesn't implement it simply never receives events and is unaffected.
+//
+// This exists so a market maker's fill accounting happens the instant the
+// engine reports it (milliseconds, over the shared WS connection already
+// used for market data) rather than up to one polling interval late, AND so
+// it costs nothing between fills — the alternative, polling GET /orders
+// every tick, pays a full HTTP round trip per desk per tick regardless of
+// whether anything happened, which is the dominant source of steady-state
+// egress for a running desk (see runtime.Manager's ws wiring).
+type FillEventHandler interface {
+	// ApplyFillEvent accounts one pushed fill notification into the
+	// strategy's state (inventory, realized PnL, resting-order bookkeeping).
+	// Called from the bot's own single-threaded tick loop (see
+	// runtime.worker), never concurrently with OnTick/Init/OnStop, so it may
+	// mutate state freely without its own locking.
+	ApplyFillEvent(ctx context.Context, deps Deps, evt FillEvent) error
+
+	// ReconcileOpenOrders replaces detectFills' old per-tick poll: a single
+	// GET /orders pass used ONLY right after (re)connecting to the engine's
+	// WS (including the very first connection), to account for anything that
+	// changed during the gap the strategy could not have been pushed. It is
+	// deliberately not part of the OnTick hot path.
+	ReconcileOpenOrders(ctx context.Context, deps Deps) error
+}
+
 // State is the persisted runtime state of a bot. Fields unused by a given
 // strategy stay zero/empty. Stored as JSONB in the bots table.
 type State struct {

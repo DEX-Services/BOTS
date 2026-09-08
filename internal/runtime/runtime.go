@@ -44,7 +44,12 @@ type Manager struct {
 	store  *store.Store
 	// index reads the shared index price for market-maker bots. May be nil
 	// when no Redis is configured; strategies that need it get a zero snapshot.
-	index   *index.Reader
+	index *index.Reader
+	// ws is the shared connection to the matching engine's broadcast /ws
+	// stream, used to push fill notifications into FillEventHandler
+	// strategies (currently just market_maker) instead of polling for them
+	// every tick. May be nil (e.g. tests) — Start/Stop route around a nil ws.
+	ws      *engine.WSClient
 	mu      sync.Mutex
 	workers map[string]*worker
 	// starting holds bot IDs mid-Start so concurrent Start calls for the same
@@ -53,9 +58,78 @@ type Manager struct {
 }
 
 // NewManager builds a manager. idx may be nil (index-dependent strategies then
-// receive a stale/zero snapshot and refuse to quote).
-func NewManager(engineClient *engine.Client, hub *marketdata.Hub, st *store.Store, idx *index.Reader) *Manager {
-	return &Manager{engine: engineClient, hub: hub, store: st, index: idx, workers: map[string]*worker{}, starting: map[string]struct{}{}}
+// receive a stale/zero snapshot and refuse to quote). ws may be nil to
+// disable pushed fill events entirely (strategies then rely solely on
+// whatever reconciliation they do in Init).
+func NewManager(engineClient *engine.Client, hub *marketdata.Hub, st *store.Store, idx *index.Reader, ws *engine.WSClient) *Manager {
+	m := &Manager{engine: engineClient, hub: hub, store: st, index: idx, ws: ws, workers: map[string]*worker{}, starting: map[string]struct{}{}}
+	if ws != nil {
+		ws.OnEvent(m.routeFillEvent)
+		ws.OnReconnect(m.reconcileAll)
+	}
+	return m
+}
+
+// routeFillEvent is the engine WS client's single global event listener
+// (see engine.WSClient's doc comment on why one shared connection beats one
+// per desk). It looks up the worker owning the event's account and hands the
+// event to that worker's own single-threaded loop via fillCh — never calls
+// into a strategy directly from this callback, which runs on the WS client's
+// read goroutine and must not race a worker's OnTick.
+func (m *Manager) routeFillEvent(evt engine.WSEvent) {
+	if evt.Order == nil || evt.Order.AccountID == "" {
+		return
+	}
+	switch evt.Type {
+	case engine.EventOrderFilled, engine.EventOrderPartial, engine.EventOrderCancelled,
+		engine.EventOrderRejected, engine.EventOrderExpired:
+	default:
+		return // not an order-lifecycle event fill accounting cares about
+	}
+	m.mu.Lock()
+	var target *worker
+	for _, w := range m.workers {
+		if w.bot.WalletAddress == evt.Order.AccountID {
+			target = w
+			break
+		}
+	}
+	m.mu.Unlock()
+	if target == nil {
+		return // no running desk for this account; nothing to do
+	}
+	fe := strategy.FillEvent{OrderID: evt.Order.ID, Status: evt.Order.Status, Filled: evt.Order.Filled}
+	select {
+	case target.fillCh <- fe:
+	default:
+		// Worker's fillCh is full (extremely unlikely — see its buffer size)
+		// or the worker is shutting down and no longer draining it. Dropping
+		// here is safe: the next ReconcileOpenOrders pass (this worker's next
+		// WS reconnect, or its own restart) will pick up the true state from
+		// the engine's authoritative /orders response.
+		slog.Warn("engine ws: dropped fill event, worker not draining", "bot", target.bot.ID, "orderId", fe.OrderID)
+	}
+}
+
+// reconcileAll signals every running worker to run its strategy's
+// ReconcileOpenOrders on its next loop iteration — invoked once per
+// successful engine WS (re)connect (including the first), since any desk
+// could have missed pushed events during the gap before that connection
+// existed. See strategy.FillEventHandler's doc comment.
+func (m *Manager) reconcileAll() {
+	m.mu.Lock()
+	workers := make([]*worker, 0, len(m.workers))
+	for _, w := range m.workers {
+		workers = append(workers, w)
+	}
+	m.mu.Unlock()
+	for _, w := range workers {
+		select {
+		case w.reconcileCh <- struct{}{}:
+		default:
+			// Already has a reconcile pending; one pass covers both reasons.
+		}
+	}
 }
 
 // StartAll resumes every bot that should be running after a restart.
@@ -186,11 +260,31 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 		wakeCh: wakeCh,
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 		startedAt: time.Now(),
+		// Buffer sized for a full ladder's worth of near-simultaneous fills
+		// (a fast sweep through several levels at once); routeFillEvent drops
+		// (with a warning) rather than blocks if this is ever exceeded, and
+		// the next reconcile pass self-heals from that.
+		fillCh:      make(chan strategy.FillEvent, 32),
+		reconcileCh: make(chan struct{}, 1),
 	}
 	m.mu.Lock()
 	m.workers[botID] = w
 	m.mu.Unlock()
 	go w.run()
+	// Prime the FillEventHandler's tracked-order view against the engine's
+	// authoritative state right away, same as an engine WS reconnect would —
+	// covers both "engine WS is still connecting" and "this desk has resting
+	// orders from before this process started" (Init already clears the
+	// persisted map for market_maker specifically, but a fresh Start on a
+	// desk that already had live orders on the book — e.g. after a crash
+	// that skipped a clean OnStop — still benefits from confirming there's
+	// nothing stray to account for).
+	if w.reconcileCh != nil {
+		select {
+		case w.reconcileCh <- struct{}{}:
+		default:
+		}
+	}
 	slog.Info("bot started", "id", botID, "strategy", bot.Strategy, "symbol", bot.Symbol)
 	return nil
 }
@@ -270,6 +364,20 @@ type worker struct {
 	startedAt time.Time
 	// consecutiveErrors counts back-to-back OnTick failures; reset on success.
 	consecutiveErrors int
+	// fillCh delivers pushed order-lifecycle events routed from the shared
+	// engine WS connection (see Manager.routeFillEvent), consumed only by
+	// this worker's own run() loop so a FillEventHandler strategy's
+	// ApplyFillEvent never races OnTick/Init/OnStop. Buffered: a burst of
+	// fills across a desk's whole ladder landing in the same instant (a fast
+	// market move sweeping several levels) should queue rather than block
+	// the WS client's single read goroutine, which serves every desk.
+	fillCh chan strategy.FillEvent
+	// reconcileCh requests one ReconcileOpenOrders pass on the next loop
+	// iteration — signaled on Start (the initial connection) and on every
+	// subsequent engine WS reconnect (see Manager.reconcileAll). Buffered 1:
+	// coalescing is correct here, a second signal before the first is
+	// serviced doesn't need a second pass.
+	reconcileCh chan struct{}
 }
 
 func (w *worker) run() {
@@ -301,9 +409,52 @@ func (w *worker) run() {
 					return
 				}
 			}
+		case evt := <-w.fillCh:
+			w.applyFillEvent(ctx, evt)
+		case <-w.reconcileCh:
+			w.reconcile(ctx)
 		case <-persist.C:
 			w.persist(ctx)
 		}
+	}
+}
+
+// applyFillEvent hands one pushed fill notification to the strategy if it
+// implements FillEventHandler, using the same Deps a normal tick would build.
+// Runs only from this worker's own loop (see fillCh's doc comment), so it's
+// safe to mutate strategy state without additional locking.
+func (w *worker) applyFillEvent(ctx context.Context, evt strategy.FillEvent) {
+	fh, ok := w.strategy.(strategy.FillEventHandler)
+	if !ok {
+		return
+	}
+	deps := w.deps(ctx)
+	if err := fh.ApplyFillEvent(ctx, deps, evt); err != nil {
+		slog.Warn("bot fill-event apply failed", "id", w.bot.ID, "orderId", evt.OrderID, "error", err)
+	}
+}
+
+// reconcile runs the strategy's full open-orders reconciliation pass if it
+// implements FillEventHandler — see ReconcileOpenOrders' doc comment for why
+// this is the only place that kind of poll still happens.
+func (w *worker) reconcile(ctx context.Context) {
+	fh, ok := w.strategy.(strategy.FillEventHandler)
+	if !ok {
+		return
+	}
+	deps := w.deps(ctx)
+	if err := fh.ReconcileOpenOrders(ctx, deps); err != nil {
+		slog.Warn("bot reconcile failed", "id", w.bot.ID, "error", err)
+	}
+}
+
+// deps builds the Deps a tick, fill event, or reconcile pass sees — factored
+// out of tick() so all three build it identically.
+func (w *worker) deps(ctx context.Context) strategy.Deps {
+	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
+	return strategy.Deps{
+		Engine: w.manager.engine, Account: w.bot.WalletAddress,
+		Bot: w.bot, MD: md, Index: w.manager.indexSnapshot(ctx, w.bot.Symbol, w.bot.Config),
 	}
 }
 
@@ -382,11 +533,7 @@ func baseAsset(symbol string) string {
 // tick runs one strategy iteration. Returns true when the bot has failed too
 // many times in a row and must stop.
 func (w *worker) tick(ctx context.Context) (halt bool) {
-	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
-	deps := strategy.Deps{
-		Engine: w.manager.engine, Account: w.bot.WalletAddress,
-		Bot: w.bot, MD: md, Index: w.manager.indexSnapshot(ctx, w.bot.Symbol, w.bot.Config),
-	}
+	deps := w.deps(ctx)
 	if err := w.strategy.OnTick(ctx, deps); err != nil {
 		w.consecutiveErrors++
 		slog.Warn("bot tick error", "id", w.bot.ID, "strategy", w.bot.Strategy,

@@ -86,7 +86,21 @@ func main() {
 		slog.Warn("REDIS_SERVICE_URI unset; market-maker bots will not quote")
 	}
 
-	manager := runtime.NewManager(engineClient, hub, st, idx)
+	// Shared connection to the matching engine's broadcast /ws stream, used
+	// to push fill notifications to market-maker desks instead of polling
+	// GET /orders every tick (see strategy.FillEventHandler's doc comment).
+	// One connection for the whole process — the engine broadcasts every
+	// account's events to every socket regardless, so per-desk sockets would
+	// only multiply connection overhead for no additional information.
+	engineWS, wsErr := engine.NewWSClient(cfg.EngineURL, cfg.WSInternalSecret)
+	if wsErr != nil {
+		slog.Warn("engine ws client disabled; market makers will poll for fills instead", "error", wsErr)
+		engineWS = nil
+	} else {
+		engineWS.Start()
+	}
+
+	manager := runtime.NewManager(engineClient, hub, st, idx, engineWS)
 
 	// Market-maker restart recovery runs before the matching engine starts (see
 	// run.sh). It clears the durable Postgres locks orphaned by the engine's
@@ -149,6 +163,9 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutting down; stopping bots")
 	manager.StopAll()
+	if engineWS != nil {
+		engineWS.Stop()
+	}
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 	_ = srv.Shutdown(shutCtx)
