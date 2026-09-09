@@ -378,14 +378,17 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request) {
 
 // validateMarketStrategy enforces that a strategy's market category matches.
 func validateMarketStrategy(strategyKey string, mkt models.Market) error {
-	if mkt != models.Spot && mkt != models.Futures {
-		return errInvalid("market must be SPOT or FUTURES")
+	if mkt != models.Spot && mkt != models.Futures && mkt != models.Options {
+		return errInvalid("market must be SPOT, FUTURES, or OPTIONS")
 	}
 	if strings.HasPrefix(strategyKey, "spot_") && mkt != models.Spot {
 		return errInvalid("this strategy is spot-only")
 	}
 	if strings.HasPrefix(strategyKey, "futures_") && mkt != models.Futures {
 		return errInvalid("this strategy is futures-only")
+	}
+	if strings.HasPrefix(strategyKey, "options_") && mkt != models.Options {
+		return errInvalid("this strategy is options-only")
 	}
 	return nil
 }

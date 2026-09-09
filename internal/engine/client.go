@@ -168,6 +168,39 @@ type Balance struct {
 	Available decimal.Decimal
 }
 
+// OptionChainEntry is one listed contract's live quote/greeks from the
+// engine's GET /option-chain, as populated by cmd/engine/main.go — theoretical
+// Black-Scholes price/greeks, blended with the contract's own book mid once
+// it has live two-sided quotes.
+type OptionChainEntry struct {
+	Symbol     string  `json:"symbol"`
+	OptionType string  `json:"optionType"` // "CALL" | "PUT"
+	Strike     string  `json:"strike"`
+	Expiry     string  `json:"expiry"` // RFC3339
+	Bid        string  `json:"bid"`
+	Ask        string  `json:"ask"`
+	Mid        string  `json:"mid"`
+	IV         float64 `json:"iv"`
+	Delta      float64 `json:"delta"`
+	Gamma      float64 `json:"gamma"`
+	Theta      float64 `json:"theta"`
+	Vega       float64 `json:"vega"`
+	Rho        float64 `json:"rho"`
+}
+
+// OptionChain fetches the live option chain for underlying (e.g. "BTC-BIUSD").
+func (c *Client) OptionChain(ctx context.Context, underlying string) ([]OptionChainEntry, error) {
+	var resp struct {
+		Underlying string             `json:"underlying"`
+		Spot       string             `json:"spot"`
+		Chain      []OptionChainEntry `json:"chain"`
+	}
+	if err := c.get(ctx, "/option-chain?underlying="+url.QueryEscape(underlying), &resp); err != nil {
+		return nil, err
+	}
+	return resp.Chain, nil
+}
+
 // SubmitOrder places an order on the engine. price is ignored for MARKET.
 func (c *Client) SubmitOrder(ctx context.Context, account, symbol, market, side, orderType string, price, qty decimal.Decimal, leverage int, marginMode string) (OrderResponse, error) {
 	q := url.Values{}

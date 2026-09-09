@@ -117,12 +117,13 @@ func dec(s string) decimal.Decimal {
 
 // registry maps strategy key -> factory. Factories validate the bot's config.
 var registry = map[string]func(bot *models.Bot) (Strategy, error){
-	"spot_grid":     newGrid,
-	"futures_grid":  newGrid,
-	"spot_dca":      newDCA,
-	"futures_dca":   newDCA,
-	"futures_twap":  newTWAP,
-	"market_maker":  newMarketMaker,
+	"spot_grid":            newGrid,
+	"futures_grid":         newGrid,
+	"spot_dca":             newDCA,
+	"futures_dca":          newDCA,
+	"futures_twap":         newTWAP,
+	"market_maker":         newMarketMaker,
+	"options_market_maker": newOptionsMarketMaker,
 }
 
 // availableStrategies is the ordered list of strategy keys, including the
@@ -130,6 +131,7 @@ var registry = map[string]func(bot *models.Bot) (Strategy, error){
 var availableStrategies = map[string]bool{
 	"spot_grid": true, "futures_grid": true, "spot_dca": true,
 	"futures_dca": true, "futures_twap": true, "market_maker": true,
+	"options_market_maker": true,
 }
 
 // Build constructs a strategy for a bot, validating its configuration.
@@ -161,6 +163,7 @@ func Templates() []models.Template {
 		{Key: "spot_algo", Title: "Spot Algo Orders", Desc: "Split large spot orders into smaller blocks.", Category: "Spot", Available: false},
 		{Key: "futures_twap", Title: "Futures TWAP", Desc: "Reduce execution impact with time-sliced orders.", Category: "Futures", Available: true, Params: twapParams()},
 		{Key: "market_maker", Title: "Market Maker", Desc: "Provide two-sided liquidity anchored to the index price.", Category: "Futures", Available: true, Params: mmParams()},
+		{Key: "options_market_maker", Title: "Options Market Maker", Desc: "Quote both sides of an option chain around theoretical fair value.", Category: "Options", Available: true, Params: optionsMMParams()},
 		{Key: "futures_vp", Title: "Futures VP", Desc: "Match order size to market urgency levels.", Category: "Futures", Available: false},
 	}
 }

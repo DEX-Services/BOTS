@@ -15,6 +15,7 @@ type Market string
 const (
 	Spot    Market = "SPOT"
 	Futures Market = "FUTURES"
+	Options Market = "OPTIONS"
 )
 
 // Status is the lifecycle state of a bot instance.

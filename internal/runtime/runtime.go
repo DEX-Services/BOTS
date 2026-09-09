@@ -294,7 +294,16 @@ func (w *worker) run() {
 				return
 			}
 		case <-indexTick.C:
-			if w.bot.Strategy == "market_maker" {
+			// options_market_maker has the same problem market_maker does —
+			// worse, in fact: each option instrument has its own (mostly
+			// idle) order book, so it can go many ticks between engine-side
+			// trades on ANY contract. The 1s wake is this desk's only
+			// reliable heartbeat; it doesn't use the index price directly
+			// (it quotes off the engine's own theoretical /option-chain
+			// fair value, which itself derives from the underlying's mark)
+			// but still needs to run on a fixed cadence rather than waiting
+			// for book activity that may never come.
+			if w.bot.Strategy == "market_maker" || w.bot.Strategy == "options_market_maker" {
 				if halted := w.tick(ctx); halted {
 					w.shutdown(ctx)
 					go w.manager.remove(w)
@@ -481,7 +490,7 @@ func computeStats(s strategy.State, md marketdata.Snapshot, idx index.Snapshot, 
 	// the zero value here. Reporting that as "0" reads as "bought at price
 	// zero" on an admin dashboard even while the desk holds real inventory —
 	// leave it blank rather than assert a cost basis that was never tracked.
-	if bot.Strategy != "market_maker" {
+	if bot.Strategy != "market_maker" && bot.Strategy != "options_market_maker" {
 		stats.AvgEntryPrice = avg.String()
 	}
 	return stats
