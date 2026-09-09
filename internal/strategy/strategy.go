@@ -71,6 +71,13 @@ type State struct {
 	QuoteHeld   string `json:"quoteHeld,omitempty"`
 	BaseAtInit  string `json:"baseAtInit,omitempty"`
 	QuoteAtInit string `json:"quoteAtInit,omitempty"`
+	// ContractPositions is options_market_maker-only: signed held quantity
+	// per option instrument symbol (positive = net long from filled buys,
+	// negative = net short from filled sells). Unlike marketMaker's single
+	// BaseHeld, this strategy holds simultaneously across many independent
+	// contracts, so it needs a per-symbol map instead of one running total.
+	// Used to compute netDelta for inventory-skewed quoting.
+	ContractPositions map[string]string `json:"contractPositions,omitempty"`
 }
 
 // OrderRef is a tracked resting order placed by the bot.

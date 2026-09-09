@@ -310,6 +310,10 @@ func (m *optionsMarketMaker) detectFills(ctx context.Context, deps Deps) error {
 // contracts and its P/L is spread capture, not cost-basis-vs-mark. Reusing
 // them would silently fold premium flow into a BaseHeld/AvgEntry number that
 // means nothing for this strategy.
+//
+// It also updates ContractPositions: a filled BUY increases this desk's
+// signed holding in ref.Kind (the instrument symbol), a filled SELL
+// decreases it — feeding netDelta's inventory-skew calculation.
 func (m *optionsMarketMaker) applyFillIfAny(ref *OrderRef, filled decimal.Decimal) {
 	applied := dec(ref.AppliedFilled)
 	delta := filled.Sub(applied)
@@ -325,19 +329,59 @@ func (m *optionsMarketMaker) applyFillIfAny(ref *OrderRef, filled decimal.Decima
 		pnl = pnl.Sub(notional)
 	}
 	m.state.RealizedPnL = pnl.String()
+
+	if m.state.ContractPositions == nil {
+		m.state.ContractPositions = map[string]string{}
+	}
+	held := dec(m.state.ContractPositions[ref.Kind])
+	if ref.Side == "BUY" {
+		held = held.Add(delta)
+	} else {
+		held = held.Sub(delta)
+	}
+	if held.IsZero() {
+		delete(m.state.ContractPositions, ref.Kind)
+	} else {
+		m.state.ContractPositions[ref.Kind] = held.String()
+	}
+
 	m.state.recordTrade(time.Now()) // increments MatchedTrades and the 24h trade-time window
 }
 
 // netDelta approximates the desk's aggregate directional exposure across all
-// quoted contracts, using each contract's engine-reported Greeks delta
-// weighted by this desk's currently-held signed size in it. Held size isn't
-// tracked per-contract by this strategy (see applyFillIfAny's comment — it
-// only tracks aggregate premium, not positions), so this returns 0 until a
-// future iteration adds per-contract position tracking; skewPerDelta is
-// therefore a no-op unless/until that lands. Kept as a named, documented stub
-// rather than silently wired to a fake number, and isolated in its own
-// function so wiring in real per-contract holdings later is a one-function
-// change.
+// quoted contracts: for each contract this desk currently holds a signed
+// position in (State.ContractPositions, updated by applyFillIfAny on every
+// fill), multiply the held size by the chain's engine-reported Greeks delta
+// for that same contract and sum. A desk net long calls and short puts (both
+// bullish) sums to a positive number; being flat or evenly hedged sums to
+// ~zero. OnTick's skew then leans BOTH quotes on every contract away from
+// this direction, discouraging further accumulation of the side the desk is
+// already exposed to — the options equivalent of marketMaker's maxInventory
+// cap, expressed as a continuous price nudge rather than a hard stop.
+//
+// Deliberately O(positions), not O(chain): most ticks hold positions in a
+// small fraction of the full listed chain, so this walks the (usually much
+// smaller) ContractPositions map and looks up each one's delta from chain,
+// rather than the reverse.
 func (m *optionsMarketMaker) netDelta(chain []engine.OptionChainEntry) decimal.Decimal {
-	return decimal.Zero
+	if len(m.state.ContractPositions) == 0 {
+		return decimal.Zero
+	}
+	deltaBySymbol := make(map[string]float64, len(chain))
+	for _, c := range chain {
+		deltaBySymbol[c.Symbol] = c.Delta
+	}
+	total := decimal.Zero
+	for symbol, heldStr := range m.state.ContractPositions {
+		held := dec(heldStr)
+		if held.IsZero() {
+			continue
+		}
+		d, ok := deltaBySymbol[symbol]
+		if !ok {
+			continue // contract fell off the chain (expired) — its delta no longer matters
+		}
+		total = total.Add(held.Mul(decimal.NewFromFloat(d)))
+	}
+	return total
 }

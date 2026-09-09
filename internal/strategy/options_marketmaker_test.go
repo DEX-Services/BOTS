@@ -3,6 +3,7 @@ package strategy
 import (
 	"testing"
 
+	"github.com/dex/bots/internal/engine"
 	"github.com/dex/bots/internal/models"
 	"github.com/shopspring/decimal"
 )
@@ -89,5 +90,70 @@ func TestOptionsMM_ApplyFillIfAny_NoNewFillIsNoop(t *testing.T) {
 	}
 	if m.state.MatchedTrades != 0 {
 		t.Fatalf("matched trades = %d, want 0 for a no-op fill", m.state.MatchedTrades)
+	}
+}
+
+func TestOptionsMM_ApplyFillIfAny_TracksSignedPosition(t *testing.T) {
+	m := &optionsMarketMaker{state: newStatePtr()}
+	symbol := "BTC-BIUSD-60000-20260101-CALL"
+
+	buy := OrderRef{OrderID: "o5", Side: "BUY", Price: "500", Kind: symbol}
+	m.applyFillIfAny(&buy, decimal.NewFromFloat(0.5))
+	if got := dec(m.state.ContractPositions[symbol]); !got.Equal(decimal.NewFromFloat(0.5)) {
+		t.Fatalf("position after a 0.5 BUY fill = %s, want 0.5", got)
+	}
+
+	sell := OrderRef{OrderID: "o6", Side: "SELL", Price: "510", Kind: symbol}
+	m.applyFillIfAny(&sell, decimal.NewFromFloat(0.2))
+	if got := dec(m.state.ContractPositions[symbol]); !got.Equal(decimal.NewFromFloat(0.3)) {
+		t.Fatalf("position after a further 0.2 SELL fill = %s, want 0.3", got)
+	}
+
+	// Selling the remainder should zero out and remove the map entry
+	// entirely (not leave a "0" string sitting around).
+	sellRest := OrderRef{OrderID: "o7", Side: "SELL", Price: "505", Kind: symbol}
+	m.applyFillIfAny(&sellRest, decimal.NewFromFloat(0.3))
+	if _, ok := m.state.ContractPositions[symbol]; ok {
+		t.Fatalf("expected ContractPositions to drop the entry once flat, still has %s", m.state.ContractPositions[symbol])
+	}
+}
+
+func TestOptionsMM_NetDelta_ZeroWithNoPositions(t *testing.T) {
+	m := &optionsMarketMaker{state: newStatePtr()}
+	chain := []engine.OptionChainEntry{{Symbol: "BTC-BIUSD-60000-20260101-CALL", Delta: 0.5}}
+	if got := m.netDelta(chain); !got.IsZero() {
+		t.Fatalf("netDelta with no held positions = %s, want 0", got)
+	}
+}
+
+func TestOptionsMM_NetDelta_WeightsHeldPositionsByChainDelta(t *testing.T) {
+	m := &optionsMarketMaker{state: newStatePtr()}
+	callSymbol := "BTC-BIUSD-60000-20260101-CALL"
+	putSymbol := "BTC-BIUSD-50000-20260101-PUT"
+	m.state.ContractPositions = map[string]string{
+		callSymbol: "2",  // long 2 calls, delta 0.6 each -> +1.2
+		putSymbol:  "-3", // short 3 puts, delta -0.4 each -> (-3)*(-0.4) = +1.2
+	}
+	chain := []engine.OptionChainEntry{
+		{Symbol: callSymbol, Delta: 0.6},
+		{Symbol: putSymbol, Delta: -0.4},
+	}
+	got := m.netDelta(chain)
+	want := decimal.NewFromFloat(2.4)
+	if !got.Equal(want) {
+		t.Fatalf("netDelta = %s, want %s", got, want)
+	}
+}
+
+func TestOptionsMM_NetDelta_IgnoresPositionsNotInChain(t *testing.T) {
+	m := &optionsMarketMaker{state: newStatePtr()}
+	expiredSymbol := "BTC-BIUSD-40000-20250101-CALL"
+	m.state.ContractPositions = map[string]string{expiredSymbol: "5"}
+	// Contract has expired and fallen off the live chain — its delta is
+	// unknowable, so it must not contribute (and must not panic on a missing
+	// map lookup).
+	got := m.netDelta(nil)
+	if !got.IsZero() {
+		t.Fatalf("netDelta for a position not in the chain = %s, want 0", got)
 	}
 }

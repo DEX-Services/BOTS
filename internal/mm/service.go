@@ -66,8 +66,8 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	if base == "" {
 		return nil, fmt.Errorf("base is required")
 	}
-	if market != models.Spot && market != models.Futures {
-		return nil, fmt.Errorf("market must be SPOT or FUTURES")
+	if market != models.Spot && market != models.Futures && market != models.Options {
+		return nil, fmt.Errorf("market must be SPOT, FUTURES, or OPTIONS")
 	}
 	symbol = strings.TrimSpace(symbol)
 	if symbol == "" {
@@ -79,6 +79,15 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	// price/qty granularity — nothing here may upper-case the symbol itself,
 	// since engine symbols are case-sensitive and the non-crypto perps carry
 	// mixed-case tickers ("CrudeOIL-BIUSD", "AAPL.us-BIUSD").
+	//
+	// An OPTIONS row in symbol_configs is keyed by the UNDERLYING spot pair
+	// (e.g. "BTC-BIUSD"), not any single option contract — each strike/
+	// expiry/type gets its own order book, created dynamically by the engine
+	// the first time an order touches it (see seed.go/validateAndPrepareOption).
+	// The underlying-level row still carries the right base/quote/tick/lot
+	// defaults for this desk to quote the whole chain against, so the same
+	// lookup works unchanged; only the "one order book" framing in this
+	// comment doesn't literally apply to options.
 	spec, err := s.store.LookupSymbol(ctx, symbol, string(market))
 	if err != nil {
 		return nil, fmt.Errorf("no active %s order book for %s — pick a listed market", market, symbol)
@@ -100,7 +109,13 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	// keys override. investment is NOT seeded here — a desk's quote budget is its
 	// quote_amount, which starts at 0 and only grows via Deposit(asset="quote").
 	// The desk therefore can't start until funded, which is the intended invariant.
-	merged := strategy.MMDefaults()
+	strategyKey := "market_maker"
+	defaults := strategy.MMDefaults
+	if market == models.Options {
+		strategyKey = "options_market_maker"
+		defaults = strategy.OptionsMMDefaults
+	}
+	merged := defaults()
 	for k, v := range cfg {
 		if v != "" {
 			merged[k] = v
@@ -126,7 +141,7 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 		UserID:        "admin",
 		WalletAddress: wallet,
 		Name:          fmt.Sprintf("MM %s %s", base, market),
-		Strategy:      "market_maker",
+		Strategy:      strategyKey,
 		Market:        market,
 		Symbol:        symbol,
 		Investment:    "0",
@@ -159,18 +174,20 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 // legAsset resolves the logical leg name ("base" or "quote") to the concrete
 // asset symbol for this desk (e.g. "BTC" / "BIUSD").
 //
-// A FUTURES desk has no base leg at all: the engine margins its position in
-// the quote currency and never moves the base asset (see the futures
-// settlement handler, which only ever debits/credits the quote). Its base is
-// just the contract's underlying — for the non-crypto perps that's a ticker
-// like "GOLD" or "AAPL.us", which is not a holdable balance anywhere on the
-// exchange. Refuse the leg here with that explanation rather than letting the
-// request reach Dex-Backend and come back as a bare "unsupported asset".
+// FUTURES and OPTIONS desks have no base leg at all: a futures desk margins
+// its position in the quote currency and never moves the base asset (see the
+// futures settlement handler, which only ever debits/credits the quote); an
+// options desk is the same — it only ever writes/buys premium in the quote
+// currency (see settlement.OptionsSettlement, which never touches a base-
+// asset balance either). Both desks' "base" is just the contract's
+// underlying ticker, not a holdable balance. Refuse the leg here with that
+// explanation rather than letting the request reach Dex-Backend and come
+// back as a bare "unsupported asset".
 func legAsset(desk *models.MarketMaker, leg string) (string, error) {
 	switch leg {
 	case "base":
-		if desk.Market == models.Futures {
-			return "", fmt.Errorf("a FUTURES desk has no base leg — it margins in %s; fund the quote leg instead", collateralAsset(desk.Market))
+		if desk.Market == models.Futures || desk.Market == models.Options {
+			return "", fmt.Errorf("a %s desk has no base leg — it margins in %s; fund the quote leg instead", desk.Market, collateralAsset(desk.Market))
 		}
 		return desk.Base, nil
 	case "quote":
