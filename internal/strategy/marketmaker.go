@@ -267,6 +267,28 @@ func (m *marketMaker) requote(ctx context.Context, deps Deps, mid decimal.Decima
 // retry attempt itself can't recurse.
 func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid decimal.Decimal, timestampMs int64, spreadBps decimal.Decimal, allowRetry bool) error {
 	held := dec(m.state.BaseHeld)
+	// Spot's sell side sizes off held (tracked purely in-memory via fill
+	// deltas since Init — see the type doc and sampleEquity's P/L comment for
+	// why it's quantity-based, not re-derived from Balance every tick like
+	// futures' quote budget below). That tracking has no path back to the
+	// engine's authoritative balance once it drifts — a missed/duplicated
+	// fill, or simply an admin deposit/withdrawal made through the MM API
+	// while the desk keeps running, throws it off permanently with no
+	// self-correction. The bug this caused in practice: held reads a few
+	// percent ABOVE the real free balance, so the sell ladder's summed qty
+	// (sized off held, see sellPerLevel below) exceeds what the account can
+	// actually lock; ReplaceMarketMakerLadder's all-or-nothing lock check
+	// then rejects the WHOLE ladder — including the buy side — forever,
+	// since nothing here ever narrows the gap back down. Re-syncing held to
+	// the live balance right before sizing, every requote, costs one cheap
+	// read and makes the desk self-heal from that drift the same tick it's
+	// hit, instead of going dark until a manual restart re-runs Init.
+	if m.market == models.Spot {
+		if bal, err := deps.Engine.Balance(ctx, deps.Account, m.base); err == nil {
+			held = bal.Balance
+			m.state.BaseHeld = held.String()
+		}
+	}
 	tenK := decimal.NewFromInt(10000)
 	numLevels := decimal.NewFromInt(int64(m.levels))
 	// Per-level quote notional: split the budget evenly across all levels/side.
