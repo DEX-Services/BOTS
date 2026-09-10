@@ -65,7 +65,19 @@ func OptionsMMDefaults() map[string]string {
 }
 
 func newOptionsMarketMaker(bot *models.Bot) (Strategy, error) {
-	investment, err := decimal.NewFromString(cfg(bot, "investment"))
+	// investment is bot.Investment (the top-level struct field/bots.investment
+	// column), NOT cfg(bot, "investment") — matching marketMaker/newGrid's
+	// identical read. An MM desk's investment is written via
+	// store.UpdateInvestment (mm.Service.recreditDesk, on every enable/
+	// restart, kept in step with the desk's funded quote_amount), which
+	// targets that column directly; desk creation also deletes "investment"
+	// from the strategy config map entirely (see mm.Service.Create) since a
+	// desk's budget is never meant to be static config. Reading it from
+	// cfg() here instead was a bug — an options desk enabled with the SAME
+	// deposit-then-enable flow as any other desk would still see this as
+	// "investment must be a positive number" and refuse to start, since
+	// cfg(bot, "investment") is always empty right after Create.
+	investment, err := decimal.NewFromString(bot.Investment)
 	if err != nil || !investment.IsPositive() {
 		return nil, fmt.Errorf("investment must be a positive number")
 	}

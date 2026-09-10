@@ -37,9 +37,36 @@ func TestNewOptionsMarketMaker_RejectsTightSpread(t *testing.T) {
 }
 
 func TestNewOptionsMarketMaker_RejectsNonPositiveInvestment(t *testing.T) {
-	_, err := newOptionsMarketMaker(optionsMMBot(map[string]string{"investment": "0"}))
+	bot := optionsMMBot(nil)
+	bot.Investment = "0" // investment is read from bot.Investment, not Config — see below
+	_, err := newOptionsMarketMaker(bot)
 	if err == nil {
 		t.Fatal("expected an error for zero investment")
+	}
+}
+
+// TestNewOptionsMarketMaker_ReadsInvestmentFromTopLevelField is a regression
+// test for a real bug: newOptionsMarketMaker used to read investment from
+// cfg(bot, "investment") (the strategy config map), but mm.Service.Create
+// explicitly deletes "investment" from that map for every desk (a desk's
+// budget is never static config — see mm.Service.Create's own comment), and
+// mm.Service.recreditDesk (which runs on every SetEnabled/restart) syncs the
+// desk's real quote budget into bot.Investment (the bots.investment column)
+// via store.UpdateInvestment, NOT into Config. A real options desk created
+// and funded through the normal admin flow therefore always had an empty
+// Config["investment"] and could never actually be enabled — it failed
+// "investment must be a positive number" every time, caught only by running
+// the real desk-creation flow end-to-end, not by the strategy's own unit
+// tests (which happened to seed Config["investment"] in their test fixture,
+// masking the bug). This test reproduces the real desk shape: Investment set
+// on the struct field, Config WITHOUT an "investment" key at all.
+func TestNewOptionsMarketMaker_ReadsInvestmentFromTopLevelField(t *testing.T) {
+	bot := &models.Bot{
+		Symbol: "BTC-BIUSD", Market: models.Options, Investment: "50000",
+		Config: map[string]string{"spreadBps": "300", "qtyPerContract": "0.1"}, // no "investment" key
+	}
+	if _, err := newOptionsMarketMaker(bot); err != nil {
+		t.Fatalf("expected success reading investment from bot.Investment, got error: %v", err)
 	}
 }
 
