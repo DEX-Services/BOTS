@@ -174,6 +174,36 @@ func (m *optionsMarketMaker) OnTick(ctx context.Context, deps Deps) error {
 	netDelta := m.netDelta(chain)
 	tenK := decimal.NewFromInt(10000)
 
+	// Budget enforcement. investment is this desk's total quote budget (its
+	// config label says exactly that: "Total quote budget backing all quoted
+	// contracts") — but until now it was validated in the constructor, stored
+	// on the struct, and then never read again. The desk quoted the ENTIRE
+	// chain, both sides, at full qtyPerContract with no cap whatsoever: a
+	// 20-contract chain meant 40 orders whose combined collateral could run
+	// far past what the desk was actually funded with, and the only thing
+	// stopping it was the engine rejecting individual orders once the wallet
+	// ran dry — i.e. the budget was enforced by running out of money, at an
+	// arbitrary point in the chain, rather than by this strategy.
+	//
+	// Cost model per quote, deliberately conservative (never under-estimates
+	// what the engine will actually reserve, so the desk stops short of its
+	// funding rather than over-committing and getting partial rejections):
+	//   BUY  — pays premium: price * qty.
+	//   SELL — writing an option is collateralized against the strike, not
+	//          the premium received, so charge strike * qty. This mirrors
+	//          risk.shortOptionMargin's conservative worst case; the engine's
+	//          margin-floor model can only ever require LESS than this, so
+	//          budgeting at the ceiling is safe in the direction that matters.
+	//
+	// Budget off the live quote balance when it's readable, for the same
+	// self-correcting reason marketMaker does (investment is a funding-time
+	// snapshot that real trading drifts away from and never updates).
+	budget := m.investment
+	if bal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset); err == nil && bal.Balance.IsPositive() {
+		budget = bal.Balance
+	}
+	spent := decimal.Zero
+
 	for _, c := range chain {
 		fair, err := decimal.NewFromString(c.Mid)
 		if err != nil || !fair.IsPositive() {
@@ -193,11 +223,24 @@ func (m *optionsMarketMaker) OnTick(ctx context.Context, deps Deps) error {
 		bidPrice := decimal.Max(skewedFair.Sub(halfSpread), decimal.NewFromFloat(0.0001))
 		askPrice := skewedFair.Add(halfSpread)
 
-		if id := m.ensureQuote(ctx, deps, c.Symbol, "BUY", bidPrice); id != "" {
-			wanted[id] = true
+		// Charge each side against the budget before placing it, and skip the
+		// side (not the whole contract) once it no longer fits — skipping only
+		// what doesn't fit keeps the desk quoting the cheaper side of deeper
+		// strikes instead of going dark on everything past the cut-off.
+		buyCost := quoteCost("BUY", bidPrice, c.Strike, m.qtyPerContract)
+		if spent.Add(buyCost).LessThanOrEqual(budget) {
+			if id := m.ensureQuote(ctx, deps, c.Symbol, "BUY", bidPrice); id != "" {
+				wanted[id] = true
+				spent = spent.Add(buyCost)
+			}
 		}
-		if id := m.ensureQuote(ctx, deps, c.Symbol, "SELL", askPrice); id != "" {
-			wanted[id] = true
+
+		sellCost := quoteCost("SELL", askPrice, c.Strike, m.qtyPerContract)
+		if spent.Add(sellCost).LessThanOrEqual(budget) {
+			if id := m.ensureQuote(ctx, deps, c.Symbol, "SELL", askPrice); id != "" {
+				wanted[id] = true
+				spent = spent.Add(sellCost)
+			}
 		}
 	}
 
@@ -211,6 +254,28 @@ func (m *optionsMarketMaker) OnTick(ctx context.Context, deps Deps) error {
 		m.cancelOne(ctx, deps, id, ref)
 	}
 	return nil
+}
+
+// quoteCost is what one option quote consumes of the desk's quote budget.
+// Extracted as a pure function so the budget rule is directly testable
+// without standing up an engine (Deps.Engine is a concrete client, not an
+// interface, so OnTick itself isn't unit-testable).
+//
+// BUY pays the premium. SELL is writing an option, which is collateralized
+// against the STRIKE rather than the premium received — charging the premium
+// there would wildly under-count the desk's real commitment (a $500 premium
+// against a $60,000 strike). This mirrors risk.shortOptionMargin's
+// conservative worst case; the engine's margin-floor model can only ever
+// require less, so budgeting at the ceiling errs toward under-quoting rather
+// than over-committing. A malformed or non-positive strike falls back to the
+// premium notional so a bad chain entry is never treated as free.
+func quoteCost(side string, price decimal.Decimal, strikeStr string, qty decimal.Decimal) decimal.Decimal {
+	if side == "SELL" {
+		if strike, err := decimal.NewFromString(strikeStr); err == nil && strike.IsPositive() {
+			return strike.Mul(qty)
+		}
+	}
+	return price.Mul(qty)
 }
 
 // ensureQuote places a fresh quote for (symbol, side) if one is not already

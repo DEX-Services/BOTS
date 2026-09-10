@@ -123,6 +123,11 @@ type EnabledDesk struct {
 	BotID  string
 	Symbol string
 	Status string
+	// Error is the bot's recorded failure message (the bots.error column),
+	// empty unless Status is "error". StartAll reads it to tell a transient
+	// runtime failure apart from a deterministic config failure — see
+	// runtime.errorIsRetryable.
+	Error string
 }
 
 // EnabledDesks returns every desk whose enabled flag is set, with its bot's
@@ -138,7 +143,7 @@ type EnabledDesk struct {
 // Ordered so the resume sequence is deterministic.
 func (s *Store) EnabledDesks(ctx context.Context) ([]EnabledDesk, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT mm.bot_id, mm.symbol, b.status
+		SELECT mm.bot_id, mm.symbol, b.status, COALESCE(b.error, '')
 		FROM market_makers mm
 		JOIN bots b ON b.id = mm.bot_id
 		WHERE mm.enabled = true
@@ -150,7 +155,7 @@ func (s *Store) EnabledDesks(ctx context.Context) ([]EnabledDesk, error) {
 	out := []EnabledDesk{}
 	for rows.Next() {
 		var d EnabledDesk
-		if err := rows.Scan(&d.BotID, &d.Symbol, &d.Status); err != nil {
+		if err := rows.Scan(&d.BotID, &d.Symbol, &d.Status, &d.Error); err != nil {
 			return nil, err
 		}
 		out = append(out, d)

@@ -28,6 +28,12 @@ const persistInterval = 3 * time.Second
 // order rejected) instead of letting it retry indefinitely.
 const maxConsecutiveErrors = 10
 
+// tickErrorHaltPrefix marks a StatusError that came from repeated tick
+// failures at RUNTIME, as opposed to one from a deterministic startup failure
+// (an invalid strategy config, unreadable persisted state). StartAll uses it
+// to decide whether a restart is worth attempting — see errorIsRetryable.
+const tickErrorHaltPrefix = "stopped after repeated tick errors; last: "
+
 // Shutdown budget for StopAll. Stops run concurrently, so these bound the DB
 // writes and the slowest single worker's teardown rather than their sum; the
 // per-worker term keeps a large desk count from crowding out the tail.
@@ -94,15 +100,35 @@ func (m *Manager) StartAll(ctx context.Context) {
 		slog.Error("startup: list enabled market-maker desks failed", "error", err)
 	}
 	for _, d := range deskBots {
-		// A desk whose bot halted itself (10 consecutive tick errors) is left
-		// alone: that status means a real, persistent failure, and reviving it
-		// every boot would just crash-loop it and overwrite the recorded error
-		// with a fresh "running". Surface it instead so it's visible rather
-		// than quietly dark, and let an admin re-enable once it's fixed.
+		// An errored desk used to be skipped unconditionally, on the reasoning
+		// that StatusError means a real, persistent failure and reviving it
+		// every boot would crash-loop it. That holds for a DETERMINISTIC
+		// failure — an invalid strategy config or corrupt persisted state will
+		// fail identically on the next boot, so retrying is pointless noise.
+		//
+		// It does not hold for a tick-error halt, which is the far more common
+		// case and is usually environmental rather than a property of the bot:
+		// the matching engine restarting, the index price going stale, the
+		// backend briefly unavailable. Ten consecutive failed ticks is only
+		// ~10 seconds of an outage, so any dependency blip long enough to
+		// notice halts every desk on the platform — and they then all stayed
+		// dark until someone re-enabled each one by hand, even though the
+		// condition that stopped them was already over. Observed exactly that
+		// during this project's own restarts.
+		//
+		// So: retry once per process start for a runtime halt, skip a
+		// deterministic one. The retry is bounded by construction — one
+		// attempt per boot, and if the underlying problem really is permanent
+		// the bot re-errors within ~10 more ticks and is skipped by the same
+		// path on the next boot only if its recorded error changed shape.
 		if d.Status == string(models.StatusError) {
-			slog.Warn("startup: enabled desk left stopped; its bot is in error state",
-				"bot", d.BotID, "symbol", d.Symbol)
-			continue
+			if !errorIsRetryable(d.Error) {
+				slog.Warn("startup: enabled desk left stopped; its bot failed in a way a restart cannot fix",
+					"bot", d.BotID, "symbol", d.Symbol, "error", d.Error)
+				continue
+			}
+			slog.Info("startup: retrying enabled desk that halted on tick errors",
+				"bot", d.BotID, "symbol", d.Symbol, "error", d.Error)
 		}
 		add(d.BotID)
 	}
@@ -115,6 +141,19 @@ func (m *Manager) StartAll(ctx context.Context) {
 		}
 	}
 	slog.Info("startup: resumed bots", "count", len(m.workers), "candidates", len(ids), "failed", failed)
+}
+
+// errorIsRetryable reports whether a bot's recorded StatusError message came
+// from a runtime tick-error halt (worth one retry on the next process start)
+// rather than a deterministic startup failure (an invalid strategy config or
+// unreadable/corrupt persisted state, which will fail the same way every time
+// and so must not be retried).
+//
+// Deliberately fails CLOSED: anything that doesn't carry the tick-halt prefix
+// is treated as non-retryable, so a new error path added later is skipped and
+// logged rather than silently crash-looped.
+func errorIsRetryable(errMsg string) bool {
+	return strings.HasPrefix(errMsg, tickErrorHaltPrefix)
 }
 
 // Start builds and runs a bot. Safe to call on an already-running bot.
@@ -403,7 +442,7 @@ func (w *worker) tick(ctx context.Context) (halt bool) {
 		if w.consecutiveErrors >= maxConsecutiveErrors {
 			slog.Error("bot stopped after repeated errors", "id", w.bot.ID, "errors", w.consecutiveErrors)
 			_ = w.manager.store.UpdateStatus(ctx, w.bot.ID, models.StatusError,
-				"stopped after repeated tick errors; last: "+err.Error())
+				tickErrorHaltPrefix+err.Error())
 			return true
 		}
 		return false

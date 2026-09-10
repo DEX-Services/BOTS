@@ -305,38 +305,61 @@ func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid deci
 	// forever — the desk was always funded for exactly half of what its own
 	// ladder asked the engine to reserve.
 	//
-	// Spot does NOT have this problem: its BUY side draws from quote_amount
-	// (BIUSD/USDT) and its SELL side is capped by actual held BASE inventory
-	// (see sellPerLevel below) — two independent currencies/pools, so the
-	// full investment is correctly available to size the buy side alone.
-	perLevel := m.investment.Div(numLevels)
+	// Spot does NOT have the 2x problem: its BUY side draws from the quote
+	// balance (BIUSD/USDT) and its SELL side is capped by actual held BASE
+	// inventory (see sellPerLevel below) — two independent currencies/pools,
+	// so the whole quote budget is correctly available to size the buy side
+	// alone.
+	//
+	// Both markets budget off the account's LIVE quote balance, not the
+	// static investment config. investment is a snapshot from whenever the
+	// desk was funded/last recredited; real trading — fees, realized PnL on
+	// closed legs, a partial liquidation — moves the actual balance both up
+	// and down from then on, and investment never follows it. Once real
+	// drift exceeds even a generous fixed-percentage buffer on top of the
+	// stale number, every requote fails "insufficient balance to lock"
+	// forever (the account HAS the room, investment just doesn't know about
+	// it any more). Reading the true current balance here keeps this
+	// self-correcting regardless of how far reality has moved from the
+	// number the desk happened to be funded with.
+	//
+	// This used to guard on `m.market == models.Futures`, leaving spot's BUY
+	// side sizing off the stale config value — the same latent defect on the
+	// quote leg that BaseHeld had on the base leg (fixed just above). It
+	// hadn't bitten yet only because the observed drift happened to run
+	// upward (a live desk measured 543k actual against 500k configured,
+	// which merely under-quotes); the moment fees/PnL push the real balance
+	// BELOW the configured number, the buy ladder asks to lock more than
+	// exists and the all-or-nothing replace rejects the entire two-sided
+	// ladder every tick, exactly as it did for futures before this same fix
+	// landed there.
+	//
+	// This is the total balance, not Available: the old ladder's reservation
+	// is about to be released and replaced by this same call, so what
+	// matters is what will be free once that happens — the full balance, not
+	// balance-minus-the-old-lock.
+	budget := m.investment
+	if bal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset); err == nil && bal.Balance.IsPositive() {
+		budget = bal.Balance
+		// Same drift problem as BaseHeld, on the quote leg: QuoteHeld is
+		// tracked purely from in-memory fill deltas (applyQuoteDelta) and
+		// never reconciled against the engine, so netPnL's quoteDelta slowly
+		// misreports. Unlike BaseHeld this one never sized an order, so it
+		// only ever corrupted the reported P/L rather than breaking quoting —
+		// but the authoritative number is already in hand here, so keep it in
+		// step rather than leaving a knowingly-wrong figure on the desk view.
+		m.state.QuoteHeld = bal.Balance.String()
+	}
+	// quoteReserveBps carves out the same kind of safety margin spot's sell
+	// side reserves (see sellReserveBps below): even sizing off the live
+	// balance, a fill landing mid-requote (detectFills only reconciles on
+	// the NEXT tick) can still nudge it a hair past exact.
+	quoteReserveBps := decimal.NewFromInt(20) // 0.2%
+	budget = budget.Mul(tenK.Sub(quoteReserveBps)).Div(tenK)
+	perLevel := budget.Div(numLevels)
 	if m.market == models.Futures {
-		// Budget off the account's LIVE quote balance, not the static
-		// investment config. investment is a snapshot from whenever the desk
-		// was funded/last recredited; real trading — fees, realized PnL on
-		// closed legs, a partial liquidation — moves the actual balance both
-		// up and down from then on, and investment never follows it. Once
-		// real drift exceeds even a generous fixed-percentage buffer on top
-		// of the stale number, every requote fails "insufficient balance to
-		// lock" forever (the account HAS the room, investment just doesn't
-		// know about it any more). Reading the true current balance here
-		// keeps this self-correcting regardless of how far reality has
-		// moved from the number the desk happened to be funded with.
-		//
-		// This is the total balance, not Available: the old ladder's
-		// reservation is about to be released and replaced by this same
-		// call, so what matters is what will be free once that happens —
-		// which is the full balance, not balance-minus-the-old-lock.
-		budget := m.investment
-		if bal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset); err == nil && bal.Balance.IsPositive() {
-			budget = bal.Balance
-		}
-		// futuresReserveBps carves out the same kind of safety margin spot's
-		// sell side reserves (see sellReserveBps below): even sizing off the
-		// live balance, a fill landing mid-requote (detectFills only
-		// reconciles on the NEXT tick) can still nudge it a hair past exact.
-		futuresReserveBps := decimal.NewFromInt(20) // 0.2%
-		budget = budget.Mul(tenK.Sub(futuresReserveBps)).Div(tenK)
+		// Futures only: halve first, since BUY and SELL both margin against
+		// this same quote currency (see the 2x explanation above).
 		perLevel = budget.Div(decimal.NewFromInt(2)).Div(numLevels)
 	}
 
