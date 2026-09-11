@@ -32,7 +32,7 @@ import (
 // all symbols, which is exactly what a many-order-book desk needs).
 type optionsMarketMaker struct {
 	state          *State
-	underlying     string // e.g. "BTC-BIUSD", passed as bot.Symbol
+	underlying     string // e.g. "BTC-BIUSDB", passed as bot.Symbol
 	quoteAsset     string
 	investment     decimal.Decimal
 	spreadBps      decimal.Decimal
@@ -43,7 +43,7 @@ type optionsMarketMaker struct {
 
 func optionsMMParams() []models.TemplateParam {
 	return []models.TemplateParam{
-		{Key: "symbol", Label: "Underlying", Type: "text", Required: true, Default: "BTC-BIUSD", Help: "The underlying spot pair, e.g. BTC-BIUSD"},
+		{Key: "symbol", Label: "Underlying", Type: "text", Required: true, Default: "BTC-BIUSDB", Help: "The underlying spot pair, e.g. BTC-BIUSDB"},
 		{Key: "investment", Label: "Investment (quote)", Type: "number", Required: true, Default: "50000", Help: "Total quote budget backing all quoted contracts"},
 		{Key: "spreadBps", Label: "Half-Spread (bps of fair value)", Type: "number", Required: true, Default: "300", Help: "Distance of each quote from theoretical fair value, in basis points of premium"},
 		{Key: "qtyPerContract", Label: "Contracts per quote", Type: "number", Required: true, Default: "0.1", Help: "Size quoted on each side of every strike/expiry"},
@@ -112,7 +112,7 @@ func newOptionsMarketMaker(bot *models.Bot) (Strategy, error) {
 		}
 	}
 	return &optionsMarketMaker{
-		state: newStatePtr(), underlying: bot.Symbol, quoteAsset: "BIUSD",
+		state: newStatePtr(), underlying: bot.Symbol, quoteAsset: "BIUSDB",
 		investment: investment, spreadBps: spreadBps, skewPerDelta: skew,
 		qtyPerContract: qtyPerContract, maxContracts: maxContracts,
 	}, nil

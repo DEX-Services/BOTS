@@ -77,9 +77,9 @@ type SymbolSpec struct {
 // The symbol match is case-INSENSITIVE but the stored spelling is what comes
 // back. Engine symbols are case-sensitive and not all of them are upper-case:
 // the non-crypto perps carry Price-Fetcher's Live-Rates.com tickers verbatim
-// ("CrudeOIL-BIUSD", "AAPL.us-BIUSD"). Upper-casing a caller's input before the
-// lookup — as this path used to — turned those into "CRUDEOIL-BIUSD" /
-// "AAPL.US-BIUSD", which match no row, so every desk on those four markets was
+// ("CrudeOIL-BIUSDB", "AAPL.us-BIUSDB"). Upper-casing a caller's input before the
+// lookup — as this path used to — turned those into "CRUDEOIL-BIUSDB" /
+// "AAPL.US-BIUSDB", which match no row, so every desk on those four markets was
 // refused as an unlisted market. Matching loosely and returning canonically
 // lets an admin type any casing and still get a desk wired to the real book.
 func (s *Store) LookupSymbol(ctx context.Context, symbol, market string) (SymbolSpec, error) {

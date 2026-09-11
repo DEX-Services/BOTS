@@ -188,7 +188,7 @@ type OptionChainEntry struct {
 	Rho        float64 `json:"rho"`
 }
 
-// OptionChain fetches the live option chain for underlying (e.g. "BTC-BIUSD").
+// OptionChain fetches the live option chain for underlying (e.g. "BTC-BIUSDB").
 func (c *Client) OptionChain(ctx context.Context, underlying string) ([]OptionChainEntry, error) {
 	var resp struct {
 		Underlying string             `json:"underlying"`

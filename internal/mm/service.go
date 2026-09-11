@@ -5,7 +5,7 @@
 //
 // Funding is admin-attested and per-leg: the admin moves real assets into the
 // treasury wallet off-platform — the actual base asset (BTC, ETH, ...) AND the
-// actual quote asset (BIUSD for both spot and futures) — then records each
+// actual quote asset (BIUSDB for both spot and futures) — then records each
 // amount here separately. Neither leg is derived from the other by any
 // formula; a desk only ever holds what it was explicitly funded with.
 // Deposits credit the engine ledger so the bot can quote against it;
@@ -28,13 +28,13 @@ import (
 )
 
 // collateralAsset returns the currency required by the desk's market. Every
-// market — spot and futures alike — quotes and collateralizes in BIUSD, the
+// market — spot and futures alike — quotes and collateralizes in BIUSDB, the
 // platform's internal stable currency; futures collateral used to be real
-// USDC, now converts to/settles in BIUSD like everything else on the
+// USDC, now converts to/settles in BIUSDB like everything else on the
 // exchange. This is the desk's quote-leg asset; the base-leg asset is always
 // desk.Base.
 func collateralAsset(market models.Market) string {
-	return "BIUSD"
+	return "BIUSDB"
 }
 
 // Service orchestrates market-maker desks: creation, funding, and start/stop.
@@ -78,10 +78,10 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	// symbol. The lookup also yields the engine's canonical spelling and its
 	// price/qty granularity — nothing here may upper-case the symbol itself,
 	// since engine symbols are case-sensitive and the non-crypto perps carry
-	// mixed-case tickers ("CrudeOIL-BIUSD", "AAPL.us-BIUSD").
+	// mixed-case tickers ("CrudeOIL-BIUSDB", "AAPL.us-BIUSDB").
 	//
 	// An OPTIONS row in symbol_configs is keyed by the UNDERLYING spot pair
-	// (e.g. "BTC-BIUSD"), not any single option contract — each strike/
+	// (e.g. "BTC-BIUSDB"), not any single option contract — each strike/
 	// expiry/type gets its own order book, created dynamically by the engine
 	// the first time an order touches it (see seed.go/validateAndPrepareOption).
 	// The underlying-level row still carries the right base/quote/tick/lot
@@ -172,7 +172,7 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 }
 
 // legAsset resolves the logical leg name ("base" or "quote") to the concrete
-// asset symbol for this desk (e.g. "BTC" / "BIUSD").
+// asset symbol for this desk (e.g. "BTC" / "BIUSDB").
 //
 // FUTURES and OPTIONS desks have no base leg at all: a futures desk margins
 // its position in the quote currency and never moves the base asset (see the
