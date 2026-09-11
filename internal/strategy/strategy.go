@@ -138,7 +138,12 @@ var registry = map[string]func(bot *models.Bot) (Strategy, error){
 var availableStrategies = map[string]bool{
 	"spot_grid": true, "futures_grid": true, "spot_dca": true,
 	"futures_dca": true, "futures_twap": true, "market_maker": true,
-	"options_market_maker": true,
+	// options_market_maker: false — DISABLED (2026-09-11 product decision:
+	// crypto spot/futures only for the current launch). This is the real
+	// enforcement point Build() checks; Templates()'s Available:false above
+	// only controls what the create-bot UI shows, so both had to change.
+	// The factory (newOptionsMarketMaker) stays registered above, untouched.
+	"options_market_maker": false,
 }
 
 // Build constructs a strategy for a bot, validating its configuration.
@@ -170,7 +175,13 @@ func Templates() []models.Template {
 		{Key: "spot_algo", Title: "Spot Algo Orders", Desc: "Split large spot orders into smaller blocks.", Category: "Spot", Available: false},
 		{Key: "futures_twap", Title: "Futures TWAP", Desc: "Reduce execution impact with time-sliced orders.", Category: "Futures", Available: true, Params: twapParams()},
 		{Key: "market_maker", Title: "Market Maker", Desc: "Provide two-sided liquidity anchored to the index price.", Category: "Futures", Available: true, Params: mmParams()},
-		{Key: "options_market_maker", Title: "Options Market Maker", Desc: "Quote both sides of an option chain around theoretical fair value.", Category: "Options", Available: true, Params: optionsMMParams()},
+		// Available: false — options are DISABLED (2026-09-11 product
+		// decision: crypto spot/futures only for the current launch, same
+		// treatment as forex/commodities/stocks). The strategy itself is
+		// untouched below; this is the same "Coming Soon" convention this
+		// list already uses for every other not-yet-live entry above
+		// (position_snowball, arbitrage, rebalancing, spot_algo, futures_vp).
+		{Key: "options_market_maker", Title: "Options Market Maker", Desc: "Quote both sides of an option chain around theoretical fair value.", Category: "Options", Available: false, Params: optionsMMParams()},
 		{Key: "futures_vp", Title: "Futures VP", Desc: "Match order size to market urgency levels.", Category: "Futures", Available: false},
 	}
 }
