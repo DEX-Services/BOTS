@@ -48,8 +48,8 @@ func (s *Server) deskView(r *http.Request, desk *models.MarketMaker) mmDeskView 
 	}
 	// Base and quote are funded independently now — no formula, just whatever
 	// the admin deposited into each leg. Expose both as-is. Every market —
-	// spot and futures — quotes in BIUSDB.
-	v.QuoteAsset = "BIUSDB"
+	// spot and futures — quotes in BI2XUSD.
+	v.QuoteAsset = "BI2XUSD"
 	v.QuoteBalance = desk.QuoteAmount
 	v.BaseBalance = desk.BaseAmount
 	return v

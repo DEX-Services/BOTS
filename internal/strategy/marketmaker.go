@@ -56,7 +56,7 @@ type marketMaker struct {
 
 func mmParams() []models.TemplateParam {
 	return []models.TemplateParam{
-		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-BIUSDB", Help: "e.g. BTC-BIUSDB"},
+		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-BI2XUSD", Help: "e.g. BTC-BI2XUSD"},
 		{Key: "investment", Label: "Investment (quote)", Type: "number", Required: true, Default: "10000", Help: "Total quote budget backing the quotes"},
 		{Key: "spreadBps", Label: "Half-Spread (bps)", Type: "number", Required: true, Default: "10", Help: "Distance of the innermost quote from index, in basis points"},
 		{Key: "levels", Label: "Levels Per Side", Type: "number", Required: true, Default: "5", Help: "How many ladder levels on each side"},
@@ -135,18 +135,18 @@ func newMarketMaker(bot *models.Bot) (Strategy, error) {
 	return &marketMaker{
 		state: newStatePtr(), symbol: bot.Symbol, base: baseAsset(bot.Symbol),
 		quoteAsset: quoteAsset(bot.Market),
-		market: bot.Market, investment: investment, spreadBps: spreadBps,
+		market:     bot.Market, investment: investment, spreadBps: spreadBps,
 		levels: levels, levelStepBps: stepBps, maxInventory: maxInv,
 		leverage: lev, marginMode: cfg(bot, "marginMode"), requoteBps: requoteBps,
 		tick: decConfig(bot, "_tickSize"), lot: decConfig(bot, "_lotSize"),
 	}, nil
 }
 
-// quoteAsset returns the desk's quote-leg currency: BIUSDB for every market,
+// quoteAsset returns the desk's quote-leg currency: BI2XUSD for every market,
 // spot and futures alike. Mirrors mm.collateralAsset (a different package,
 // same rule) since the strategy needs to read its own quote-asset balance too.
 func quoteAsset(market models.Market) string {
-	return "BIUSDB"
+	return "BI2XUSD"
 }
 
 // decConfig parses a decimal config key, returning zero when absent or invalid.
@@ -306,7 +306,7 @@ func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid deci
 	// ladder asked the engine to reserve.
 	//
 	// Spot does NOT have the 2x problem: its BUY side draws from the quote
-	// balance (BIUSDB/USDT) and its SELL side is capped by actual held BASE
+	// balance (BI2XUSD/USDT) and its SELL side is capped by actual held BASE
 	// inventory (see sellPerLevel below) — two independent currencies/pools,
 	// so the whole quote budget is correctly available to size the buy side
 	// alone.

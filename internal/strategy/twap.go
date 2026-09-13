@@ -16,21 +16,21 @@ import (
 // recorded at the current mid (approximate), and the bot accumulates a
 // position it does not auto-close.
 type twap struct {
-	state      *State
-	symbol     string
-	market     models.Market
-	side       string
-	totalQty   decimal.Decimal
-	slices     int
-	sliceEvery time.Duration
+	state       *State
+	symbol      string
+	market      models.Market
+	side        string
+	totalQty    decimal.Decimal
+	slices      int
+	sliceEvery  time.Duration
 	qtyPerSlice decimal.Decimal
-	leverage   int
-	marginMode string
+	leverage    int
+	marginMode  string
 }
 
 func twapParams() []models.TemplateParam {
 	return []models.TemplateParam{
-		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-BIUSDB"},
+		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-BI2XUSD"},
 		{Key: "investment", Label: "Reference Budget (quote)", Type: "number", Required: false, Default: "1000"},
 		{Key: "side", Label: "Side", Type: "select", Required: true, Default: "BUY", Options: []string{"BUY", "SELL"}},
 		{Key: "totalQty", Label: "Total Quantity (base)", Type: "number", Required: true, Default: "1", Help: "Total base size to execute"},
@@ -68,7 +68,7 @@ func newTWAP(bot *models.Bot) (Strategy, error) {
 		state: newStatePtr(), symbol: bot.Symbol, market: bot.Market, side: side,
 		totalQty: total, slices: slices, sliceEvery: time.Duration(dur) * time.Second / time.Duration(slices),
 		qtyPerSlice: total.Div(decimal.NewFromInt(int64(slices))),
-		leverage: lev, marginMode: cfg(bot, "marginMode"),
+		leverage:    lev, marginMode: cfg(bot, "marginMode"),
 	}, nil
 }
 
