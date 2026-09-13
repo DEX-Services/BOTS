@@ -56,7 +56,7 @@ type marketMaker struct {
 
 func mmParams() []models.TemplateParam {
 	return []models.TemplateParam{
-		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BTC-BI2XUSD", Help: "e.g. BTC-BI2XUSD"},
+		{Key: "symbol", Label: "Trading Pair", Type: "text", Required: true, Default: "BI2X-BI2XUSD", Help: "e.g. BI2X-BI2XUSD (spot) or BTC-BI2XUSD (futures)"},
 		{Key: "investment", Label: "Investment (quote)", Type: "number", Required: true, Default: "10000", Help: "Total quote budget backing the quotes"},
 		{Key: "spreadBps", Label: "Half-Spread (bps)", Type: "number", Required: true, Default: "10", Help: "Distance of the innermost quote from index, in basis points"},
 		{Key: "levels", Label: "Levels Per Side", Type: "number", Required: true, Default: "5", Help: "How many ladder levels on each side"},
