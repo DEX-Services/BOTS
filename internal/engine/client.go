@@ -313,13 +313,28 @@ func (c *Client) FuturesPositions(ctx context.Context, account string) ([]Future
 	return resp.Futures, nil
 }
 
+// tickerResponse mirrors the engine's actual GET /ticker JSON shape (see
+// matching-engine/cmd/engine/ticker.go's TickerResponse) — bestBid/bestAsk/
+// midPrice as decimal strings, not the "key=value" text format this client
+// used to (incorrectly) expect. That mismatch made every field silently fail
+// to parse and return a zero Ticker forever, which every strategy relying on
+// a live mid price (grid, DCA, TWAP, market-maker) depends on to trade.
+type tickerResponse struct {
+	Symbol   string `json:"symbol"`
+	Market   string `json:"market"`
+	BestBid  string `json:"bestBid"`
+	BestAsk  string `json:"bestAsk"`
+	MidPrice string `json:"midPrice"`
+	Spread   string `json:"spread"`
+}
+
 // Ticker fetches best bid/ask/mid for a symbol/market.
 func (c *Client) Ticker(ctx context.Context, symbol, market string) (Ticker, error) {
-	body, err := c.getRaw(ctx, "/ticker?symbol="+url.QueryEscape(symbol)+"&market="+url.QueryEscape(market))
-	if err != nil {
+	var resp tickerResponse
+	if err := c.get(ctx, "/ticker?symbol="+url.QueryEscape(symbol)+"&market="+url.QueryEscape(market), &resp); err != nil {
 		return Ticker{}, err
 	}
-	return parseTicker(body)
+	return parseTicker(resp)
 }
 
 // Balance fetches the in-memory ledger balance for an account/asset.
@@ -355,33 +370,6 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	return c.do(req, out)
 }
 
-func (c *Client) getRaw(ctx context.Context, path string) (string, error) {
-	if err := c.acquire(ctx); err != nil {
-		return "", err
-	}
-	defer c.release()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
-	if err != nil {
-		return "", err
-	}
-	if c.engineSecret != "" {
-		req.Header.Set("X-Engine-Secret", c.engineSecret)
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("engine %s: %s", resp.Status, strings.TrimSpace(string(b)))
-	}
-	return string(b), nil
-}
-
 func (c *Client) do(req *http.Request, out any) error {
 	if c.engineSecret != "" {
 		req.Header.Set("X-Engine-Secret", c.engineSecret)
@@ -404,33 +392,31 @@ func (c *Client) do(req *http.Request, out any) error {
 	return json.Unmarshal(b, out)
 }
 
-// parseTicker parses "symbol=BTC-USDT market=spot bid=.. ask=.. mid=.. spread=..".
-// A malformed numeric field is a hard error: silently coercing an unparseable
-// price to zero would feed bots a fake market (bid/ask of 0), so surface it.
-func parseTicker(s string) (Ticker, error) {
-	t := Ticker{}
-	for _, field := range strings.Fields(strings.TrimSpace(s)) {
-		k, v, ok := strings.Cut(field, "=")
-		if !ok {
-			continue
+// parseTicker converts the engine's JSON ticker fields (decimal strings) into
+// a Ticker. A malformed numeric field is a hard error: silently coercing an
+// unparseable price to zero would feed bots a fake market (bid/ask of 0), so
+// surface it instead.
+func parseTicker(r tickerResponse) (Ticker, error) {
+	t := Ticker{Symbol: r.Symbol, Market: r.Market}
+	var err error
+	if r.BestBid != "" {
+		if t.Bid, err = decimal.NewFromString(r.BestBid); err != nil {
+			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", "bestBid", r.BestBid, err)
 		}
-		var err error
-		switch k {
-		case "symbol":
-			t.Symbol = v
-		case "market":
-			t.Market = v
-		case "bid":
-			t.Bid, err = decimal.NewFromString(v)
-		case "ask":
-			t.Ask, err = decimal.NewFromString(v)
-		case "mid":
-			t.Mid, err = decimal.NewFromString(v)
-		case "spread":
-			t.Spread, err = decimal.NewFromString(v)
+	}
+	if r.BestAsk != "" {
+		if t.Ask, err = decimal.NewFromString(r.BestAsk); err != nil {
+			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", "bestAsk", r.BestAsk, err)
 		}
-		if err != nil {
-			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", k, v, err)
+	}
+	if r.MidPrice != "" {
+		if t.Mid, err = decimal.NewFromString(r.MidPrice); err != nil {
+			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", "midPrice", r.MidPrice, err)
+		}
+	}
+	if r.Spread != "" {
+		if t.Spread, err = decimal.NewFromString(r.Spread); err != nil {
+			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", "spread", r.Spread, err)
 		}
 	}
 	if t.Mid.IsZero() && !t.Bid.IsZero() && !t.Ask.IsZero() {
