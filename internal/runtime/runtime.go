@@ -202,11 +202,22 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 		}
 		strat.Restore(st)
 	}
+	// Looked up once per Start, not per tick — lot/tick size never change for
+	// a symbol mid-run, and this is a DB round-trip. A lookup failure (symbol
+	// not found/inactive) leaves lot/tick at zero, which snapToLot treats as
+	// "don't round" — acceptable for now since Build() above already
+	// validates the symbol exists via other means for most strategies, but
+	// worth revisiting if a genuinely-unlisted symbol ever reaches here.
+	var lotSize, tickSize decimal.Decimal
+	if spec, serr := m.store.LookupSymbol(ctx, bot.Symbol, string(bot.Market)); serr == nil {
+		lotSize, tickSize = spec.Lot, spec.Tick
+	}
 	wakeCh := m.hub.Subscribe(bot.Symbol, string(bot.Market))
 	deps := strategy.Deps{
 		Engine: m.engine, Account: bot.WalletAddress, Bot: bot,
 		MD:    m.hub.Snapshot(bot.Symbol, string(bot.Market)),
 		Index: m.indexSnapshot(ctx, bot.Symbol, bot.Config),
+		Lot:   lotSize, Tick: tickSize,
 	}
 	// Strategies may reconcile external state before they begin ticking. In
 	// particular, a market maker clears stale persisted order IDs here so a
@@ -225,6 +236,7 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 		wakeCh: wakeCh,
 		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
 		startedAt: time.Now(),
+		lotSize:   lotSize, tickSize: tickSize,
 	}
 	m.mu.Lock()
 	m.workers[botID] = w
@@ -309,6 +321,10 @@ type worker struct {
 	startedAt time.Time
 	// consecutiveErrors counts back-to-back OnTick failures; reset on success.
 	consecutiveErrors int
+	// lot/tick are the bot's symbol granularity, looked up once at Start and
+	// reused for every Deps built during this run (see strategy.Deps.Lot's
+	// doc comment for why every quantity-computing strategy needs this).
+	lotSize, tickSize decimal.Decimal
 }
 
 func (w *worker) run() {
@@ -434,6 +450,7 @@ func (w *worker) tick(ctx context.Context) (halt bool) {
 	deps := strategy.Deps{
 		Engine: w.manager.engine, Account: w.bot.WalletAddress,
 		Bot: w.bot, MD: md, Index: w.manager.indexSnapshot(ctx, w.bot.Symbol, w.bot.Config),
+		Lot: w.lotSize, Tick: w.tickSize,
 	}
 	if err := w.strategy.OnTick(ctx, deps); err != nil {
 		w.consecutiveErrors++
@@ -465,7 +482,7 @@ func (w *worker) shutdown(ctx context.Context) {
 	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
 	deps := strategy.Deps{
 		Engine: w.manager.engine, Account: w.bot.WalletAddress,
-		Bot: w.bot, MD: md,
+		Bot: w.bot, MD: md, Lot: w.lotSize, Tick: w.tickSize,
 	}
 	if err := w.strategy.OnStop(ctx, deps); err != nil {
 		slog.Warn("bot on-stop error", "id", w.bot.ID, "error", err)

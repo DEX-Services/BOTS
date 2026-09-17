@@ -100,20 +100,38 @@ func (g *grid) Init(ctx context.Context, deps Deps) error {
 	if mid.IsZero() {
 		return fmt.Errorf("no market data for %s; cannot initialise grid", g.symbol)
 	}
+	var attempted, failed int
+	var lastErr error
 	for i, p := range g.levels {
 		buy := p.LessThan(mid)
 		sell := p.GreaterThan(mid)
 		// Spot only places buys initially (self-funding); futures places both
 		// sides because leverage lets it short without holding base.
 		if buy {
+			attempted++
 			if err := g.place(ctx, deps, "BUY", i, p); err != nil {
+				failed++
+				lastErr = err
 				slog.Warn("grid init buy failed", "symbol", g.symbol, "level", i, "error", err)
 			}
 		} else if sell && g.market == models.Futures {
+			attempted++
 			if err := g.place(ctx, deps, "SELL", i, p); err != nil {
+				failed++
+				lastErr = err
 				slog.Warn("grid init sell failed", "symbol", g.symbol, "level", i, "error", err)
 			}
 		}
+	}
+	// Every level rejected is a deterministic config problem (undersized
+	// investment for the grid count, wrong lot size), not a transient one —
+	// surface it now rather than leaving the bot at status=running with an
+	// empty, permanently non-trading ladder (confirmed live: a 10-grid bot
+	// on this symbol failed all 10 initial orders instantly with no visible
+	// error). A partial failure (some levels placed) is left as a warning
+	// only, since the grid can still trade on the levels that did place.
+	if attempted > 0 && failed == attempted {
+		return fmt.Errorf("every initial grid order rejected (last: %w)", lastErr)
 	}
 	g.state.InitDone = true
 	g.lastMid = mid
@@ -156,9 +174,9 @@ func (g *grid) Snapshot() State { return *g.state }
 func (g *grid) Restore(s State) { g.state = &s }
 
 func (g *grid) place(ctx context.Context, deps Deps, side string, level int, price decimal.Decimal) error {
-	qty := g.qtyPerLevel(price)
+	qty := snapToLot(g.qtyPerLevel(price), deps.Lot)
 	if !qty.IsPositive() {
-		return fmt.Errorf("zero qty at level %d", level)
+		return fmt.Errorf("zero qty at level %d after rounding to lot size", level)
 	}
 	resp, err := deps.Engine.SubmitOrder(ctx, deps.Account, g.symbol, string(g.market), side, "LIMIT", price, qty, g.leverage, g.marginMode)
 	if err != nil {

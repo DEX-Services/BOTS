@@ -85,19 +85,45 @@ func (t *twap) OnTick(ctx context.Context, deps Deps) error {
 			return err
 		}
 	}
+	// Once tripped, keep failing every tick — not just the once-per-slice
+	// ticks that actually attempt an order. The runtime's own halt counter
+	// (maxConsecutiveErrors in runtime.go) only accumulates across
+	// consecutive ERRORING ticks; between slice attempts, OnTick's normal
+	// early-returns below all return nil, which resets that counter back to
+	// 0 before the next slice attempt ever fires. Without this check a
+	// permanently-failing TWAP never actually halts: `consecutive` in the
+	// logs was observed stuck at 1 forever instead of climbing to
+	// maxConsecutiveErrors, live, before this fix.
+	if t.state.ConsecutiveOrderFails >= maxConsecutiveOrderFailures {
+		return fmt.Errorf("twap halted after repeated order failures: %s", t.state.LastOrderError)
+	}
 	mid := deps.MD.Mid
 	if mid.IsZero() {
 		return nil
 	}
 	now := time.Now().UnixMilli()
 	if t.state.SlicesDone < t.slices && now >= t.state.NextSliceMs {
-		resp, err := deps.Engine.SubmitOrder(ctx, deps.Account, t.symbol, string(t.market), t.side, "MARKET", decimal.Zero, t.qtyPerSlice, t.leverage, t.marginMode)
+		qty := snapToLot(t.qtyPerSlice, deps.Lot)
+		if !qty.IsPositive() {
+			err := fmt.Errorf("slice qty rounds to zero at lot size %s (investment too small for %d slices)", deps.Lot.String(), t.slices)
+			slog.Warn("twap slice qty rounds to zero at lot size, skipping", "symbol", t.symbol, "slice", t.state.SlicesDone)
+			t.state.NextSliceMs += t.sliceEvery.Milliseconds()
+			if t.state.recordOrderFailure(err) {
+				return fmt.Errorf("twap slice repeatedly unsizeable: %w", err)
+			}
+			return nil
+		}
+		resp, err := deps.Engine.SubmitOrder(ctx, deps.Account, t.symbol, string(t.market), t.side, "MARKET", decimal.Zero, qty, t.leverage, t.marginMode)
 		if err != nil {
 			slog.Warn("twap slice failed", "symbol", t.symbol, "slice", t.state.SlicesDone, "error", err)
+			if t.state.recordOrderFailure(err) {
+				return fmt.Errorf("twap slice repeatedly rejected: %w", err)
+			}
 		} else {
+			t.state.recordOrderSuccess()
 			filled := dec(resp.Filled)
 			if !filled.IsPositive() {
-				filled = t.qtyPerSlice
+				filled = qty
 			}
 			signed := filled
 			if t.side == "SELL" {

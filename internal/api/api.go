@@ -13,6 +13,7 @@ import (
 	"github.com/dex/bots/internal/runtime"
 	"github.com/dex/bots/internal/store"
 	"github.com/dex/bots/internal/strategy"
+	"github.com/shopspring/decimal"
 )
 
 // Server is the bots HTTP API.
@@ -244,12 +245,45 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "strategy not available")
 		return
 	}
+	// market_maker/options_market_maker are only offered through the
+	// admin-managed desk flow (POST /admin/mm -> mm.Service.Create), never
+	// through this regular user create path. The strategy's own P/L
+	// accounting (see marketmaker.go's Init/requoteWithSpread) diffs the
+	// account's WHOLE engine-ledger balance against its own snapshot — a
+	// valid proxy only for a dedicated, admin-funded desk wallet that
+	// nothing else touches. On a shared regular user wallet running other
+	// bots/trades, that same balance moves for unrelated reasons and gets
+	// misreported as this bot's PnL (confirmed live: a fresh test account
+	// showed swings of thousands of dollars in reported PnL with zero real
+	// trades). A regular wallet also normally holds zero base-asset
+	// inventory, which permanently blocks a spot desk's sell side from ever
+	// forming a valid two-sided ladder. Both are fixable in principle, but
+	// until then this strategy is admin-desk-only.
+	if req.Strategy == "market_maker" || req.Strategy == "options_market_maker" {
+		writeErr(w, http.StatusBadRequest, "market maker bots are only available as admin-managed desks right now")
+		return
+	}
 	if err := validateMarketStrategy(req.Strategy, req.Market); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// minInvestment guards against a bot that can never place a valid order:
+	// an undersized investment computes an order quantity that rounds to
+	// zero (or below) at the symbol's lot size, so the bot creates
+	// successfully, shows status "running", and silently does nothing
+	// forever — confirmed live with a $1 futures_twap/spot_dca, both
+	// accepted at creation and then failing every single order attempt
+	// for the entire test run with no visible error. $10 is a conservative
+	// floor; strategies needing more (e.g. grid, which divides investment
+	// across many levels) still validate their own per-level minimum in
+	// strategy.Build below.
+	const minInvestment = "10"
 	if req.Investment == "" {
 		req.Investment = "0"
+	}
+	if inv, err := decimal.NewFromString(req.Investment); err != nil || inv.LessThan(decimal.RequireFromString(minInvestment)) {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("investment must be at least %s", minInvestment))
+		return
 	}
 	bot := &models.Bot{
 		Name: req.Name, Strategy: req.Strategy, Market: req.Market, Symbol: req.Symbol,

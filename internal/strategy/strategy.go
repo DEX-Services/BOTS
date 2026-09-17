@@ -35,6 +35,19 @@ type Deps struct {
 	// market price instead of the (circular) engine book mid. Zero-value
 	// (Fresh=false) when no index reader is configured.
 	Index index.Snapshot
+	// Lot/Tick are the engine's quantity/price granularity for the bot's
+	// symbol, looked up once at Start and reused for every tick. The engine
+	// rejects any order whose quantity isn't an exact multiple of Lot, so
+	// every strategy that computes its own order size (grid, DCA, TWAP) must
+	// round DOWN to Lot before calling SubmitOrder — market-maker already did
+	// this (see marketmaker.go's snapQty); grid/DCA/TWAP did not, which made
+	// them fail every single order on any symbol where investment/price
+	// arithmetic doesn't happen to land on an exact multiple of Lot (i.e.
+	// virtually always). Zero means "unknown, don't round" (e.g. symbol not
+	// found in symbol_configs) — callers should treat that as "can't safely
+	// trade" rather than silently submitting an unrounded quantity.
+	Lot  decimal.Decimal
+	Tick decimal.Decimal
 }
 
 // Strategy is the interface every bot strategy implements.
@@ -78,6 +91,42 @@ type State struct {
 	// contracts, so it needs a per-symbol map instead of one running total.
 	// Used to compute netDelta for inventory-skewed quoting.
 	ContractPositions map[string]string `json:"contractPositions,omitempty"`
+	// LastOrderError and ConsecutiveOrderFails track order-submission
+	// failures that a strategy would otherwise just log and silently retry
+	// forever (e.g. every SubmitOrder call rejected by the engine for an
+	// undersized/unrounded quantity — confirmed live: a bot sat at
+	// status=running with matchedTrades=0 for the entire test run, no
+	// visible indication anything was wrong). Grid/DCA/TWAP's OnTick calls
+	// recordOrderFailure on a failed SubmitOrder and recordOrderSuccess on a
+	// real fill; once ConsecutiveOrderFails crosses
+	// maxConsecutiveOrderFailures, OnTick returns the error instead of nil,
+	// which feeds the runtime's existing tick-error-halt machinery
+	// (runtime.go's maxConsecutiveErrors) and surfaces a real Bot.error to
+	// the user instead of a permanently-silent no-op.
+	LastOrderError        string `json:"lastOrderError,omitempty"`
+	ConsecutiveOrderFails int    `json:"consecutiveOrderFails,omitempty"`
+}
+
+// maxConsecutiveOrderFailures bounds how many back-to-back failed order
+// attempts a strategy tolerates before surfacing the failure as a real
+// OnTick error (see State.ConsecutiveOrderFails's doc comment). A few
+// retries absorb a transient blip (engine restart, momentary rate limit);
+// beyond that it's almost certainly a deterministic config problem (wrong
+// lot size, undersized investment) that will never self-resolve.
+const maxConsecutiveOrderFailures = 5
+
+// recordOrderFailure tracks a failed SubmitOrder call and reports whether
+// the strategy should now surface this as a real OnTick error.
+func (s *State) recordOrderFailure(err error) bool {
+	s.LastOrderError = err.Error()
+	s.ConsecutiveOrderFails++
+	return s.ConsecutiveOrderFails >= maxConsecutiveOrderFailures
+}
+
+// recordOrderSuccess clears the failure streak after a real fill.
+func (s *State) recordOrderSuccess() {
+	s.LastOrderError = ""
+	s.ConsecutiveOrderFails = 0
 }
 
 // OrderRef is a tracked resting order placed by the bot.
@@ -120,6 +169,21 @@ func newStatePtr() *State { s := newState(); return &s }
 func dec(s string) decimal.Decimal {
 	d, _ := decimal.NewFromString(s)
 	return d
+}
+
+// snapToLot rounds a computed order quantity DOWN to the symbol's lot size —
+// the engine rejects any order whose quantity isn't an exact multiple of it.
+// A zero/unknown lot passes qty through unchanged (see Deps.Lot's doc
+// comment): grid, DCA, and TWAP all call this on their computed quantity
+// before SubmitOrder, matching the rounding market-maker's own snapQty method
+// already applied — without it, virtually every real config produces a
+// quantity that isn't an exact multiple of lot size, and every order attempt
+// fails forever with "quantity X not a multiple of lot size Y".
+func snapToLot(qty, lot decimal.Decimal) decimal.Decimal {
+	if lot.IsZero() {
+		return qty
+	}
+	return qty.Div(lot).Floor().Mul(lot)
 }
 
 // registry maps strategy key -> factory. Factories validate the bot's config.
@@ -174,7 +238,13 @@ func Templates() []models.Template {
 		{Key: "spot_dca", Title: "Spot DCA", Desc: "Lower average entry cost with recurring buys.", Category: "Spot", Available: true, Params: dcaParams(true)},
 		{Key: "spot_algo", Title: "Spot Algo Orders", Desc: "Split large spot orders into smaller blocks.", Category: "Spot", Available: false},
 		{Key: "futures_twap", Title: "Futures TWAP", Desc: "Reduce execution impact with time-sliced orders.", Category: "Futures", Available: true, Params: twapParams()},
-		{Key: "market_maker", Title: "Market Maker", Desc: "Provide two-sided liquidity anchored to the index price.", Category: "Futures", Available: true, Params: mmParams()},
+		// Available: false in THIS listing only — market_maker is admin-desk-only
+		// (see api.go's handleCreate), not offered through the regular user
+		// create-bot flow. availableStrategies above stays true because the
+		// admin desk path (mm.Service.Create) still calls strategy.Build for
+		// it; only this public template card is marked unavailable so the
+		// create-bot UI shows it as "Coming soon" instead of clickable.
+		{Key: "market_maker", Title: "Market Maker", Desc: "Provide two-sided liquidity anchored to the index price.", Category: "Futures", Available: false, Params: mmParams()},
 		// Available: false — options are DISABLED (2026-09-11 product
 		// decision: crypto spot/futures only for the current launch, same
 		// treatment as forex/commodities/stocks). The strategy itself is

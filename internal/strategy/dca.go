@@ -89,6 +89,14 @@ func (d *dca) OnTick(ctx context.Context, deps Deps) error {
 			return err
 		}
 	}
+	// Once tripped, fail every tick, not just the once-per-interval ticks
+	// that actually attempt a buy — see twap.go's identical guard for why:
+	// the runtime's halt counter only accumulates across consecutive
+	// ERRORING ticks, and every tick between buy attempts returns nil here,
+	// which would otherwise reset that counter before the next attempt.
+	if d.state.ConsecutiveOrderFails >= maxConsecutiveOrderFailures {
+		return fmt.Errorf("dca halted after repeated order failures: %s", d.state.LastOrderError)
+	}
 	mid := deps.MD.Mid
 	if mid.IsZero() {
 		return nil
@@ -98,16 +106,23 @@ func (d *dca) OnTick(ctx context.Context, deps Deps) error {
 		d.sampleEquity(mid)
 		return nil
 	}
-	qty := d.amount.Div(mid)
+	qty := snapToLot(d.amount.Div(mid), deps.Lot)
 	if !qty.IsPositive() {
+		if d.state.recordOrderFailure(fmt.Errorf("amount %s rounds to zero at lot size %s", d.amount.String(), deps.Lot.String())) {
+			return fmt.Errorf("dca amount repeatedly unsizeable: %s", d.state.LastOrderError)
+		}
 		return nil
 	}
 	resp, err := deps.Engine.SubmitOrder(ctx, deps.Account, d.symbol, string(d.market), d.side, "MARKET", decimal.Zero, qty, d.leverage, d.marginMode)
 	if err != nil {
 		slog.Warn("dca order failed", "symbol", d.symbol, "error", err)
 		d.sampleEquity(mid)
+		if d.state.recordOrderFailure(err) {
+			return fmt.Errorf("dca order repeatedly rejected: %w", err)
+		}
 		return nil
 	}
+	d.state.recordOrderSuccess()
 	filled := dec(resp.Filled)
 	if !filled.IsPositive() {
 		filled = qty // engine may omit filled for immediate market fills
