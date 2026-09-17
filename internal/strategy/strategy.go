@@ -186,6 +186,28 @@ func snapToLot(qty, lot decimal.Decimal) decimal.Decimal {
 	return qty.Div(lot).Floor().Mul(lot)
 }
 
+// isTerminalOrderStatus reports whether an engine order status means the order
+// can no longer be matched, and so that its reported filled quantity is final.
+// Mirrors the matching engine's own models.Order.IsTerminal.
+//
+// This distinction matters because the engine's GET /order/status answers from
+// its durable Postgres record once an order has left the live book, and that
+// record is maintained by an async writer — an order that just filled reports
+// found=true with a stale status=OPEN/filled=0 row for a window afterwards.
+// Callers must only finalize (account the fill, stop tracking the order) on a
+// terminal status; a non-terminal one means "not written yet, ask again".
+//
+// Fails CLOSED: an unrecognised status is treated as non-terminal, so a new
+// engine status added later causes a harmless extra reconcile rather than a
+// silently dropped fill.
+func isTerminalOrderStatus(status string) bool {
+	switch status {
+	case "FILLED", "CANCELLED", "REJECTED", "EXPIRED":
+		return true
+	}
+	return false
+}
+
 // registry maps strategy key -> factory. Factories validate the bot's config.
 var registry = map[string]func(bot *models.Bot) (Strategy, error){
 	"spot_grid":            newGrid,

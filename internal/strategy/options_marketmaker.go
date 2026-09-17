@@ -367,6 +367,15 @@ func (m *optionsMarketMaker) detectFills(ctx context.Context, deps Deps) error {
 		if !st.Found {
 			continue // durable record not yet caught up; retry next tick
 		}
+		// A found-but-non-terminal record is the same lag in a different shape:
+		// the engine's durable row exists from submission (status=OPEN,
+		// filled=0) and is updated to the terminal state asynchronously, so a
+		// just-filled quote reads back as unfilled for a window. Finalizing on
+		// it would drop the premium from this desk's P/L for good. See
+		// isTerminalOrderStatus.
+		if !isTerminalOrderStatus(st.Status) {
+			continue
+		}
 		r := ref
 		m.applyFillIfAny(&r, dec(st.Filled))
 		delete(m.state.OpenOrders, key)

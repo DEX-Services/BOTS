@@ -245,44 +245,19 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "strategy not available")
 		return
 	}
-	// market_maker/options_market_maker are only offered through the
-	// admin-managed desk flow (POST /admin/mm -> mm.Service.Create), never
-	// through this regular user create path. The strategy's own P/L
-	// accounting (see marketmaker.go's Init/requoteWithSpread) diffs the
-	// account's WHOLE engine-ledger balance against its own snapshot — a
-	// valid proxy only for a dedicated, admin-funded desk wallet that
-	// nothing else touches. On a shared regular user wallet running other
-	// bots/trades, that same balance moves for unrelated reasons and gets
-	// misreported as this bot's PnL (confirmed live: a fresh test account
-	// showed swings of thousands of dollars in reported PnL with zero real
-	// trades). A regular wallet also normally holds zero base-asset
-	// inventory, which permanently blocks a spot desk's sell side from ever
-	// forming a valid two-sided ladder. Both are fixable in principle, but
-	// until then this strategy is admin-desk-only.
-	if req.Strategy == "market_maker" || req.Strategy == "options_market_maker" {
-		writeErr(w, http.StatusBadRequest, "market maker bots are only available as admin-managed desks right now")
+	if err := validateUserStrategy(req.Strategy); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := validateMarketStrategy(req.Strategy, req.Market); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// minInvestment guards against a bot that can never place a valid order:
-	// an undersized investment computes an order quantity that rounds to
-	// zero (or below) at the symbol's lot size, so the bot creates
-	// successfully, shows status "running", and silently does nothing
-	// forever — confirmed live with a $1 futures_twap/spot_dca, both
-	// accepted at creation and then failing every single order attempt
-	// for the entire test run with no visible error. $10 is a conservative
-	// floor; strategies needing more (e.g. grid, which divides investment
-	// across many levels) still validate their own per-level minimum in
-	// strategy.Build below.
-	const minInvestment = "10"
 	if req.Investment == "" {
 		req.Investment = "0"
 	}
-	if inv, err := decimal.NewFromString(req.Investment); err != nil || inv.LessThan(decimal.RequireFromString(minInvestment)) {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("investment must be at least %s", minInvestment))
+	if err := validateUserInvestment(req.Investment); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	bot := &models.Bot{
@@ -388,6 +363,19 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "bot is not public")
 		return
 	}
+	// A copy is a user-created bot in every sense that matters — it runs under
+	// the caller's account, spending the caller's funds — so it has to clear
+	// the same gates handleCreate applies. The source bot's own provenance
+	// proves nothing: it may predate these rules, or have been created through
+	// the admin desk path, which applies neither.
+	if err := validateUserStrategy(src.Strategy); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateUserInvestment(src.Investment); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	copy := &models.Bot{
 		Name:       "Copy of " + src.Name,
 		Strategy:   src.Strategy,
@@ -408,6 +396,57 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, copy)
+}
+
+// validateUserStrategy rejects strategies that exist but are not offered
+// through the regular user-facing bot flows.
+//
+// market_maker/options_market_maker are admin-managed desks only (POST
+// /admin/mm -> mm.Service.Create). Their P/L accounting (see marketmaker.go's
+// Init/requoteWithSpread) diffs the account's WHOLE engine-ledger balance
+// against its own snapshot — a valid proxy only for a dedicated, admin-funded
+// desk wallet nothing else touches. On a shared user wallet running other bots
+// and manual trades, that balance moves for unrelated reasons and is
+// misreported as this bot's PnL (confirmed live: a fresh test account showed
+// swings of thousands of dollars with zero real trades). A regular wallet also
+// normally holds no base inventory, which permanently blocks a spot desk's sell
+// side from forming a two-sided ladder. Both are fixable in principle; until
+// then these stay admin-only.
+//
+// strategy.Build cannot enforce this, because the admin desk path legitimately
+// calls it for exactly these strategies — so every user-facing entry point has
+// to check here. That means handleCopy as much as handleCreate: copy takes an
+// arbitrary public bot's strategy and instantiates it under the caller's own
+// account, so without this it is a way to obtain a bot that create refuses.
+func validateUserStrategy(strategyKey string) error {
+	if strategyKey == "market_maker" || strategyKey == "options_market_maker" {
+		return errInvalid("market maker bots are only available as admin-managed desks right now")
+	}
+	return nil
+}
+
+// minInvestment is the floor for a user-created bot's quote budget.
+//
+// An undersized investment computes an order quantity that rounds to zero at
+// the symbol's lot size, so the bot creates fine, reports status "running",
+// and silently never trades — confirmed live with a $1 futures_twap and
+// spot_dca, both accepted and then failing every order attempt for the whole
+// run. $10 is a conservative floor; strategies that divide the budget further
+// (grid, across levels) still validate their own per-level minimum in
+// strategy.Build.
+const minInvestment = "10"
+
+// validateUserInvestment enforces minInvestment on a user-supplied budget.
+// Applied on copy as well as create: a copy inherits the source bot's
+// investment verbatim, so a public bot created before this floor existed (or
+// by the admin desk path, which does not apply it) would otherwise hand every
+// user who copies it a bot that can never place a valid order.
+func validateUserInvestment(investment string) error {
+	inv, err := decimal.NewFromString(investment)
+	if err != nil || inv.LessThan(decimal.RequireFromString(minInvestment)) {
+		return errInvalid(fmt.Sprintf("investment must be at least %s", minInvestment))
+	}
+	return nil
 }
 
 // validateMarketStrategy enforces that a strategy's market category matches.

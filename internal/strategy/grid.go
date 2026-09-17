@@ -96,6 +96,22 @@ func newGrid(bot *models.Bot) (Strategy, error) {
 }
 
 func (g *grid) Init(ctx context.Context, deps Deps) error {
+	// Resuming an already-seeded grid must not re-seed it. The runtime calls
+	// Init once per Start, INCLUDING the Start that resumes a bot after a
+	// restart — and by then Restore has already loaded persisted state whose
+	// OpenOrders are real orders still resting on the engine. Placing the
+	// whole ladder again would double every level: a second set of live
+	// orders, a second set of balance locks, and a tracked-order map the
+	// strategy would then try to flip twice per price level.
+	//
+	// OnTick already gates its own deferred seeding on this exact flag; Init
+	// was the one path that ignored it. Re-seeding only happens after OnStop,
+	// which clears InitDone precisely so a later start re-seeds around the
+	// then-current price.
+	if g.state.InitDone {
+		g.lastMid = deps.MD.Mid
+		return nil
+	}
 	mid := deps.MD.Mid
 	if mid.IsZero() {
 		return fmt.Errorf("no market data for %s; cannot initialise grid", g.symbol)
@@ -225,6 +241,30 @@ func (g *grid) detectFillsAndFlip(ctx context.Context, deps Deps) error {
 		}
 		if !st.Found {
 			continue // async-writer lag; reconcile on a later tick
+		}
+		// Found is NOT the same as settled. /order/status falls back to the
+		// engine's durable Postgres record once an order leaves the live book,
+		// and that row is written by an ASYNC event-log writer: it exists from
+		// the moment the order was created (status=OPEN, filled=0) and is only
+		// updated to its terminal state some time after the match actually
+		// happens. So an order that just filled reports Found=true with a
+		// still-OPEN, still-zero-filled row for a window after it vanished
+		// from /orders.
+		//
+		// Treating that as authoritative is destructive and unrecoverable:
+		// the code below deletes the order from OpenOrders, so the fill is
+		// never accounted (no inventory, no PnL, no matchedTrades) and the
+		// level never flips into its opposite order — the grid silently goes
+		// one level dark per fill. Confirmed live: a spot_grid BUY at 8.27
+		// filled 7.55743 and settled in the engine ledger, while the bot's
+		// own state stayed at matchedTrades=0 / baseHeld=0 forever and no
+		// SELL was placed.
+		//
+		// Only a genuinely terminal record is safe to act on. Anything else
+		// is lag, and is handled exactly like !Found above: keep the order
+		// tracked and re-resolve it on a later tick.
+		if !isTerminalOrderStatus(st.Status) {
+			continue
 		}
 		r := ref
 		if g.state.applyFillDelta(&r, dec(st.Filled), price).IsPositive() {

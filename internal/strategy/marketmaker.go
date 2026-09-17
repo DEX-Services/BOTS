@@ -594,6 +594,17 @@ func (m *marketMaker) detectFills(ctx context.Context, deps Deps) error {
 			// it will resolve on a later tick.
 			continue
 		}
+		// Found is not the same as settled — see isTerminalOrderStatus. Once an
+		// order leaves the live book /order/status answers from the engine's
+		// durable Postgres row, which the async event-log writer creates at
+		// order-submission time (status=OPEN, filled=0) and only updates to the
+		// terminal state afterwards. Accounting that stale row as final would
+		// delete the order below having applied a zero fill delta, so a real
+		// fill in that window is lost from this desk's inventory and P/L
+		// permanently. Same lag, same handling as !Found: keep tracking.
+		if !isTerminalOrderStatus(st.Status) {
+			continue
+		}
 		r := ref
 		delta := m.state.applyFillDelta(&r, dec(st.Filled), price)
 		if delta.IsPositive() {

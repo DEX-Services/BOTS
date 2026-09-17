@@ -34,6 +34,14 @@ const maxConsecutiveErrors = 10
 // to decide whether a restart is worth attempting — see errorIsRetryable.
 const tickErrorHaltPrefix = "stopped after repeated tick errors; last: "
 
+// resumeFailedPrefix marks a StatusError recorded because StartAll could not
+// bring a previously-running bot back up. Like a tick halt this is usually
+// environmental (a dependency still coming up as the process boots), not a
+// property of the bot, so it is treated as retryable on the NEXT start rather
+// than disabling the bot for good — which matters most for market-maker desks,
+// where a one-off failed resume must not take the desk permanently dark.
+const resumeFailedPrefix = "could not be resumed after a restart; last: "
+
 // Shutdown budget for StopAll. Stops run concurrently, so these bound the DB
 // writes and the slowest single worker's teardown rather than their sum; the
 // per-worker term keeps a large desk count from crowding out the tail.
@@ -138,6 +146,18 @@ func (m *Manager) StartAll(ctx context.Context) {
 		if err := m.Start(ctx, id); err != nil {
 			failed++
 			slog.Warn("startup: resume bot failed", "id", id, "error", err)
+			// A bot that was running before the restart and could not be
+			// resumed must not keep claiming status=running. Start only
+			// updates the row for a few specific failures (an invalid config,
+			// corrupt state); anything else — including a failed Init — left
+			// the row untouched, so it still read "running" with no worker
+			// behind it and no error to show. The user then saw a healthy
+			// running bot whose real orders were resting unmanaged on the
+			// engine, locks held, with nothing left to detect their fills or
+			// cancel them. Recording the failure is what makes that state
+			// visible and actionable (stop releases the orders).
+			_ = m.store.UpdateStatus(ctx, id, models.StatusError,
+				resumeFailedPrefix+err.Error())
 		}
 	}
 	slog.Info("startup: resumed bots", "count", len(m.workers), "candidates", len(ids), "failed", failed)
@@ -153,7 +173,8 @@ func (m *Manager) StartAll(ctx context.Context) {
 // is treated as non-retryable, so a new error path added later is skipped and
 // logged rather than silently crash-looped.
 func errorIsRetryable(errMsg string) bool {
-	return strings.HasPrefix(errMsg, tickErrorHaltPrefix)
+	return strings.HasPrefix(errMsg, tickErrorHaltPrefix) ||
+		strings.HasPrefix(errMsg, resumeFailedPrefix)
 }
 
 // Start builds and runs a bot. Safe to call on an already-running bot.
@@ -213,9 +234,27 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 		lotSize, tickSize = spec.Lot, spec.Tick
 	}
 	wakeCh := m.hub.Subscribe(bot.Symbol, string(bot.Market))
+	// Subscribe starts the symbol's poller on its own goroutine, so for the
+	// first bot on a symbol the hub has NOTHING cached at this instant and
+	// Snapshot returns the zero value. Strategies that need a price to seed
+	// themselves (grid's Init refuses outright without a mid) then fail the
+	// whole Start on what is purely a cold-cache timing artifact.
+	//
+	// That hurt worst exactly where it matters most — resuming after a crash.
+	// StartAll runs seconds after boot, before any feed has warmed, so a
+	// perfectly healthy user grid failed to resume with "no market data",
+	// leaving its row at status=running with no worker and no error: the UI
+	// showed it running while its real orders sat unmanaged on the engine,
+	// their balance locks held, with nothing left to ever detect a fill or
+	// cancel them. Confirmed live via kill -9.
+	//
+	// Waiting briefly for the first poll costs nothing in the warm case
+	// (Snapshot returns immediately) and is bounded, so a genuinely dead
+	// symbol still fails rather than hanging startup.
+	md := m.awaitMarketData(ctx, bot.Symbol, string(bot.Market))
 	deps := strategy.Deps{
 		Engine: m.engine, Account: bot.WalletAddress, Bot: bot,
-		MD:    m.hub.Snapshot(bot.Symbol, string(bot.Market)),
+		MD:    md,
 		Index: m.indexSnapshot(ctx, bot.Symbol, bot.Config),
 		Lot:   lotSize, Tick: tickSize,
 	}
@@ -246,6 +285,34 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 	return nil
 }
 
+// marketDataWarmup bounds how long Start waits for a freshly-subscribed symbol
+// feed to publish its first snapshot. The hub polls the engine on its own
+// interval, so this only needs to cover one poll plus the engine round trip;
+// a symbol that cannot produce a price in this long is not one a bot should
+// start trading on anyway, and the strategy's own Init gets to reject it.
+const marketDataWarmup = 5 * time.Second
+
+// awaitMarketData returns the symbol's snapshot, waiting up to
+// marketDataWarmup for the first one when the feed was only just subscribed.
+// Returns whatever it has when the budget expires (possibly still zero) and
+// lets the caller's strategy decide whether that is fatal.
+func (m *Manager) awaitMarketData(ctx context.Context, symbol, market string) marketdata.Snapshot {
+	deadline := time.Now().Add(marketDataWarmup)
+	for {
+		if snap := m.hub.Snapshot(symbol, market); !snap.Zero() {
+			return snap
+		}
+		if time.Now().After(deadline) {
+			return m.hub.Snapshot(symbol, market)
+		}
+		select {
+		case <-ctx.Done():
+			return m.hub.Snapshot(symbol, market)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 // Stop cancels a bot's resting orders and stops its worker.
 func (m *Manager) Stop(ctx context.Context, botID string) error {
 	m.mu.Lock()
@@ -255,13 +322,53 @@ func (m *Manager) Stop(ctx context.Context, botID string) error {
 	}
 	m.mu.Unlock()
 	if !ok {
-		// Not running; just ensure the DB reflects stopped.
+		// No live worker — but that does NOT mean there is nothing on the
+		// exchange. A bot whose process was killed mid-run, or whose resume
+		// failed, still has every order it placed resting on the engine with
+		// its balance locks held, recorded only in the bot's persisted state.
+		// Marking the row stopped and returning (as this used to) reported
+		// success while leaving those orders live and unmanaged forever, with
+		// no remaining way for the user to get that money back — confirmed
+		// live: after a kill -9, stop returned 200 and the account's reserved
+		// balance did not move at all.
+		m.cancelPersistedOrders(ctx, botID)
 		return m.store.MarkStopped(ctx, botID)
 	}
 	close(w.stopCh)
 	<-w.doneCh
 	m.hub.Unsubscribe(w.bot.Symbol, string(w.bot.Market), w.wakeCh)
 	return m.store.MarkStopped(ctx, botID)
+}
+
+// cancelPersistedOrders cancels the orders recorded in a stopped bot's
+// persisted state, for the case where no live worker exists to do it (the
+// process was killed mid-run, or the bot failed to resume). Best-effort by
+// design: it runs on the user-facing stop path, and an order that is already
+// gone — filled, cancelled, or lost to an engine restart — simply errors
+// harmlessly here. Failures are logged, never returned, so the caller still
+// marks the bot stopped rather than leaving it stuck as running.
+func (m *Manager) cancelPersistedOrders(ctx context.Context, botID string) {
+	bot, err := m.store.Get(ctx, botID)
+	if err != nil || len(bot.State) == 0 {
+		return
+	}
+	raw, err := json.Marshal(bot.State)
+	if err != nil {
+		return
+	}
+	var st strategy.State
+	if err := json.Unmarshal(raw, &st); err != nil {
+		slog.Warn("orphan cleanup: unreadable persisted state", "id", botID, "error", err)
+		return
+	}
+	for id := range st.OpenOrders {
+		if _, err := m.engine.CancelOrder(ctx, bot.WalletAddress, bot.Symbol, string(bot.Market), id); err != nil {
+			slog.Warn("orphan cleanup: cancel failed", "id", botID, "order", id, "error", err)
+			continue
+		}
+		slog.Info("orphan cleanup: cancelled order left by a stopped worker",
+			"id", botID, "order", id, "symbol", bot.Symbol)
+	}
 }
 
 // StopAll gracefully stops every worker (used on shutdown).
