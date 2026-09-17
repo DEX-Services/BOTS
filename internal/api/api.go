@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dex/bots/internal/auth"
@@ -42,6 +43,9 @@ func (s *Server) Routes() http.Handler {
 	// so the frontend header reads the same number the MM quotes and marks P/L
 	// against, instead of an independent Binance REST poll.
 	mux.HandleFunc("GET /index/{base}", methodGuard(http.MethodGet, s.handleIndex))
+	// Batch form of the same data for the /markets page, which needs every
+	// listed base's price in one poll rather than one request per instrument.
+	mux.HandleFunc("GET /indexes", methodGuard(http.MethodGet, s.handleIndexes))
 	// Same data over Server-Sent Events at the price-fetcher's 1s cadence, so
 	// the frontend can drop its per-second GET /index/{base} polling. One
 	// stream per open tab replaces that tab's 1 req/s with a single pushed
@@ -146,6 +150,70 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"low":           snap.Low24h,
 		"quoteVolume":   snap.QuoteVolume,
 	})
+}
+
+// handleIndexes is the batch form of handleIndex: the /markets page needs
+// every listed instrument's price on every poll, and one request per base
+// (previously what the frontend WOULD have had to do, since this endpoint
+// didn't exist at all — GET /indexes 404'd, which is why the page showed
+// no data) doesn't scale with the instrument count. bases is a
+// comma-separated list of exact tickers, same casing rules as
+// IndexSnapshotExact (see handleIndex's comment — NOT upper-cased).
+func (s *Server) handleIndexes(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.URL.Query().Get("bases"))
+	if raw == "" {
+		writeErr(w, http.StatusBadRequest, "bases required")
+		return
+	}
+	var bases []string
+	for _, b := range strings.Split(raw, ",") {
+		if b = strings.TrimSpace(b); b != "" {
+			bases = append(bases, b)
+		}
+	}
+	if len(bases) == 0 {
+		writeErr(w, http.StatusBadRequest, "bases required")
+		return
+	}
+
+	type indexItem struct {
+		Base          string  `json:"base"`
+		Price         string  `json:"price"`
+		Fresh         bool    `json:"fresh"`
+		Status        string  `json:"status"`
+		AgeMs         int64   `json:"ageMs"`
+		TimestampMs   int64   `json:"timestampMs"`
+		ChangePercent float64 `json:"changePercent"`
+		High          float64 `json:"high"`
+		Low           float64 `json:"low"`
+		QuoteVolume   float64 `json:"quoteVolume"`
+	}
+
+	items := make([]indexItem, len(bases))
+	var wg sync.WaitGroup
+	for i, base := range bases {
+		wg.Add(1)
+		go func(i int, base string) {
+			defer wg.Done()
+			snap := s.manager.IndexSnapshotExact(r.Context(), base)
+			status := "unavailable"
+			if snap.Price.IsPositive() {
+				status = "stale"
+				if snap.Fresh {
+					status = "live"
+				}
+			}
+			items[i] = indexItem{
+				Base: base, Price: snap.Price.String(), Fresh: snap.Fresh, Status: status,
+				AgeMs: snap.AgeMs, TimestampMs: snap.TimestampMs,
+				ChangePercent: snap.ChangePercent, High: snap.High24h, Low: snap.Low24h,
+				QuoteVolume: snap.QuoteVolume,
+			}
+		}(i, base)
+	}
+	wg.Wait()
+
+	writeJSON(w, http.StatusOK, map[string]any{"indexes": items})
 }
 
 // handleIndexStream serves the same Redis-backed index snapshot as handleIndex
