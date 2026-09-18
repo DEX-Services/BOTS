@@ -1,6 +1,6 @@
 module github.com/dex/bots
 
-go 1.24
+go 1.26.0
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -20,4 +20,5 @@ require (
 	golang.org/x/crypto v0.17.0 // indirect
 	golang.org/x/sync v0.1.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
 )
