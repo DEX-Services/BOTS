@@ -118,7 +118,7 @@ func main() {
 
 	verifier := auth.NewVerifier(cfg.JWTSecret)
 	server := api.NewServer(st, manager, verifier, mmSvc)
-	handler := api.CORS(cfg.AllowedOrigins, api.RateLimit(server.Routes()))
+	handler := api.CORS(cfg.AllowedOrigins, api.RateLimit(api.MaxBody(server.Routes())))
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

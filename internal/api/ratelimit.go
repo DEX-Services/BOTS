@@ -62,6 +62,18 @@ func (s *limiterStore) reapLoop() {
 	}
 }
 
+// maxBodyBytes caps every request body (M2): no handler in this service set
+// any body-size limit before this.
+const maxBodyBytes = 1 << 20
+
+// MaxBody wraps next so every request body is capped at maxBodyBytes.
+func MaxBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		next.ServeHTTP(w, r)
+	})
+}
+
 // RateLimit wraps next with a per-client-IP token bucket: 20 req/sec
 // sustained, burst of 40 — matches Dex-Backend's general tier. Generous
 // enough for the trade page's polling (my-bots refresh, marketplace) to
