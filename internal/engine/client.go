@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
 
@@ -76,6 +77,13 @@ func (c *Client) LedgerSync(ctx context.Context, account, asset, amount, directi
 	}
 	body, err := json.Marshal(map[string]string{
 		"accountId": account, "asset": asset, "amount": amount, "direction": direction,
+		// requestId (M4) lets the engine recognize a resend of this exact
+		// call as a duplicate rather than re-applying it — see
+		// matching-engine's ledgerSyncDedup. LedgerSync itself doesn't
+		// retry internally, but a caller one level up (or a client-side
+		// timeout that resends after the first attempt actually landed)
+		// can still produce two physical requests for one logical call.
+		"requestId": uuid.NewString(),
 	})
 	if err != nil {
 		return err
