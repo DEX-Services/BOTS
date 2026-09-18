@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -27,7 +28,11 @@ type Client struct {
 	sem     chan struct{}
 	// engineSecret authenticates privileged calls (/internal/ledger/sync).
 	// Empty ⇒ LedgerSync returns an error rather than calling unauthenticated.
-	engineSecret string
+	// atomic.Value (not a plain string) because SetEngineSecret and every
+	// LedgerSync call read/write this concurrently with no other
+	// synchronization — a plain field here was a real data race (Low-1) if
+	// SetEngineSecret were ever called while a request was in flight.
+	engineSecret atomic.Value
 }
 
 // NewClient builds an engine client. concurrency bounds in-flight calls.
@@ -50,8 +55,14 @@ func NewClient(baseURL string, concurrency int) *Client {
 }
 
 // SetEngineSecret sets the shared secret used to authenticate privileged
-// engine calls (/internal/ledger/sync). Call once at startup.
-func (c *Client) SetEngineSecret(secret string) { c.engineSecret = secret }
+// engine calls (/internal/ledger/sync).
+func (c *Client) SetEngineSecret(secret string) { c.engineSecret.Store(secret) }
+
+// getEngineSecret returns the current secret, or "" if never set.
+func (c *Client) getEngineSecret() string {
+	v, _ := c.engineSecret.Load().(string)
+	return v
+}
 
 // LedgerSync credits or debits an account's in-memory engine ledger balance
 // via /internal/ledger/sync. direction must be "credit" or "debit". Used by
@@ -59,7 +70,8 @@ func (c *Client) SetEngineSecret(secret string) { c.engineSecret = secret }
 // if the engine secret is unset or the engine rejects the change (e.g. a debit
 // exceeding balance).
 func (c *Client) LedgerSync(ctx context.Context, account, asset, amount, direction string) error {
-	if c.engineSecret == "" {
+	secret := c.getEngineSecret()
+	if secret == "" {
 		return fmt.Errorf("engine secret not configured; cannot sync ledger")
 	}
 	body, err := json.Marshal(map[string]string{
@@ -77,7 +89,7 @@ func (c *Client) LedgerSync(ctx context.Context, account, asset, amount, directi
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Engine-Secret", c.engineSecret)
+	req.Header.Set("X-Engine-Secret", secret)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
@@ -371,8 +383,8 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 }
 
 func (c *Client) do(req *http.Request, out any) error {
-	if c.engineSecret != "" {
-		req.Header.Set("X-Engine-Secret", c.engineSecret)
+	if secret := c.getEngineSecret(); secret != "" {
+		req.Header.Set("X-Engine-Secret", secret)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
