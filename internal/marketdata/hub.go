@@ -148,6 +148,14 @@ func (f *feed) refresh(symbol, market string) {
 	if last.IsZero() {
 		last = t.Bid
 	}
+	// Mid and Bid are both zero right after a full-fill trade that leaves no
+	// resting orders on either side — the book is genuinely empty even
+	// though the symbol has real trade history. Fall back to the engine's
+	// markPrice (set from the last trade) so a strategy's Init doesn't treat
+	// "no live quotes right now" the same as "never traded".
+	if last.IsZero() {
+		last = t.Mark
+	}
 	snap := &Snapshot{
 		Symbol: t.Symbol, Market: t.Market,
 		Bid: t.Bid, Ask: t.Ask, Mid: t.Mid, Last: last,

@@ -114,6 +114,15 @@ func (g *grid) Init(ctx context.Context, deps Deps) error {
 	}
 	mid := deps.MD.Mid
 	if mid.IsZero() {
+		// No live two-sided quote (book momentarily empty on one or both
+		// sides), but the symbol may still have real trade history — use the
+		// last trade price as the seed for the grid's levels rather than
+		// refusing to start. A cold symbol that has genuinely never traded
+		// still has Last zero too, so this still fails correctly for that
+		// case.
+		mid = deps.MD.Last
+	}
+	if mid.IsZero() {
 		return fmt.Errorf("no market data for %s; cannot initialise grid", g.symbol)
 	}
 	var attempted, failed int

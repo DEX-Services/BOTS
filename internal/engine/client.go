@@ -177,6 +177,12 @@ type Ticker struct {
 	Ask    decimal.Decimal
 	Mid    decimal.Decimal
 	Spread decimal.Decimal
+	// Mark is the engine's markPrice — populated from the last trade even
+	// when the book currently has no resting orders on one or both sides
+	// (so Bid/Ask/Mid are all zero). Used as a last-resort price source so a
+	// symbol that has traded, but whose book is momentarily empty, doesn't
+	// look identical to a symbol that has never traded at all.
+	Mark decimal.Decimal
 }
 
 // Balance is parsed from /admin/balance.
@@ -340,12 +346,13 @@ func (c *Client) FuturesPositions(ctx context.Context, account string) ([]Future
 // to parse and return a zero Ticker forever, which every strategy relying on
 // a live mid price (grid, DCA, TWAP, market-maker) depends on to trade.
 type tickerResponse struct {
-	Symbol   string `json:"symbol"`
-	Market   string `json:"market"`
-	BestBid  string `json:"bestBid"`
-	BestAsk  string `json:"bestAsk"`
-	MidPrice string `json:"midPrice"`
-	Spread   string `json:"spread"`
+	Symbol    string `json:"symbol"`
+	Market    string `json:"market"`
+	BestBid   string `json:"bestBid"`
+	BestAsk   string `json:"bestAsk"`
+	MidPrice  string `json:"midPrice"`
+	Spread    string `json:"spread"`
+	MarkPrice string `json:"markPrice"`
 }
 
 // Ticker fetches best bid/ask/mid for a symbol/market.
@@ -437,6 +444,11 @@ func parseTicker(r tickerResponse) (Ticker, error) {
 	if r.Spread != "" {
 		if t.Spread, err = decimal.NewFromString(r.Spread); err != nil {
 			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", "spread", r.Spread, err)
+		}
+	}
+	if r.MarkPrice != "" {
+		if t.Mark, err = decimal.NewFromString(r.MarkPrice); err != nil {
+			return Ticker{}, fmt.Errorf("ticker field %q=%q: %w", "markPrice", r.MarkPrice, err)
 		}
 	}
 	if t.Mid.IsZero() && !t.Bid.IsZero() && !t.Ask.IsZero() {

@@ -253,7 +253,7 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 	// symbol still fails rather than hanging startup.
 	md := m.awaitMarketData(ctx, bot.Symbol, string(bot.Market))
 	deps := strategy.Deps{
-		Engine: m.engine, Account: bot.WalletAddress, Bot: bot,
+		Engine: m.engine, Account: bot.UserID, Bot: bot,
 		MD:    md,
 		Index: m.indexSnapshot(ctx, bot.Symbol, bot.Config),
 		Lot:   lotSize, Tick: tickSize,
@@ -362,7 +362,7 @@ func (m *Manager) cancelPersistedOrders(ctx context.Context, botID string) {
 		return
 	}
 	for id := range st.OpenOrders {
-		if _, err := m.engine.CancelOrder(ctx, bot.WalletAddress, bot.Symbol, string(bot.Market), id); err != nil {
+		if _, err := m.engine.CancelOrder(ctx, bot.UserID, bot.Symbol, string(bot.Market), id); err != nil {
 			slog.Warn("orphan cleanup: cancel failed", "id", botID, "order", id, "error", err)
 			continue
 		}
@@ -555,7 +555,7 @@ func baseAsset(symbol string) string {
 func (w *worker) tick(ctx context.Context) (halt bool) {
 	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
 	deps := strategy.Deps{
-		Engine: w.manager.engine, Account: w.bot.WalletAddress,
+		Engine: w.manager.engine, Account: w.bot.UserID,
 		Bot: w.bot, MD: md, Index: w.manager.indexSnapshot(ctx, w.bot.Symbol, w.bot.Config),
 		Lot: w.lotSize, Tick: w.tickSize,
 	}
@@ -588,7 +588,7 @@ func (w *worker) persist(ctx context.Context) {
 func (w *worker) shutdown(ctx context.Context) {
 	md := w.manager.hub.Snapshot(w.bot.Symbol, string(w.bot.Market))
 	deps := strategy.Deps{
-		Engine: w.manager.engine, Account: w.bot.WalletAddress,
+		Engine: w.manager.engine, Account: w.bot.UserID,
 		Bot: w.bot, MD: md, Lot: w.lotSize, Tick: w.tickSize,
 	}
 	if err := w.strategy.OnStop(ctx, deps); err != nil {
