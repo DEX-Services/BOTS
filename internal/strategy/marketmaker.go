@@ -52,6 +52,12 @@ type marketMaker struct {
 	// desk creation (keys _tickSize / _lotSize); zero means "don't round".
 	tick decimal.Decimal
 	lot  decimal.Decimal
+	// maxQuantity is the engine's per-order quantity ceiling for this symbol
+	// (deps.MaxQuantity, captured in Init). Each ladder level is capped to it:
+	// without this, a low-priced symbol (DOGE) with a large quote budget sized
+	// levels above the cap, and the engine rejected the ENTIRE all-or-nothing
+	// ladder on every tick ("quantity exceeds maximum quantity").
+	maxQuantity decimal.Decimal
 }
 
 func mmParams() []models.TemplateParam {
@@ -158,6 +164,7 @@ func decConfig(bot *models.Bot, key string) decimal.Decimal {
 }
 
 func (m *marketMaker) Init(ctx context.Context, deps Deps) error {
+	m.maxQuantity = deps.MaxQuantity
 	// A stopped bot may have persisted order IDs after its orders were already
 	// cancelled (or may have live quotes left by an interrupted shutdown). Do
 	// not trust that snapshot on a manual restart: reconcile against the engine
@@ -178,23 +185,31 @@ func (m *marketMaker) Init(ctx context.Context, deps Deps) error {
 	// (spread capture), or less (a loss) — independent of price. So Init's
 	// job is just to snapshot "what do we hold right now" as the zero point;
 	// sampleEquity below diffs current holdings against this snapshot.
+	//
+	// Spot desks reset BOTH legs here. Futures desks have no base leg (they
+	// margin in the quote asset), but they must still snapshot the quote
+	// baseline: skipping it left QuoteAtInit at "0", so the entire deposit
+	// read as phantom profit and every futures desk reported a fixed 100% ROI
+	// (deposit / deposit) no matter how it actually traded.
 	if m.market == models.Spot {
 		baseBal, err := deps.Engine.Balance(ctx, deps.Account, m.base)
 		if err != nil {
 			return fmt.Errorf("read base inventory baseline: %w", err)
 		}
-		quoteBal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset)
-		if err != nil {
-			return fmt.Errorf("read quote inventory baseline: %w", err)
-		}
 		m.state.BaseHeld = baseBal.Balance.String()
-		m.state.QuoteHeld = quoteBal.Balance.String()
 		m.state.BaseAtInit = baseBal.Balance.String()
-		m.state.QuoteAtInit = quoteBal.Balance.String()
 		m.state.RealizedPnL = "0"
 		m.state.MatchedTrades = 0
 		m.state.TradeTimes = nil
 		m.state.Equity = nil
+	}
+	if m.market == models.Spot || m.market == models.Futures {
+		quoteBal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset)
+		if err != nil {
+			return fmt.Errorf("read quote inventory baseline: %w", err)
+		}
+		m.state.QuoteHeld = quoteBal.Balance.String()
+		m.state.QuoteAtInit = quoteBal.Balance.String()
 	}
 	m.state.InitDone = true
 	return nil
@@ -490,7 +505,12 @@ func (m *marketMaker) snapPrice(price decimal.Decimal, isAsk bool) decimal.Decim
 
 // snapQty rounds an order quantity DOWN to the symbol's lot size, so the desk
 // never quotes more base than the budget backs. A zero lot passes through.
+// Also caps at the engine's per-order MaxQuantity (zero = uncapped) — one
+// oversized level would reject the whole all-or-nothing ladder.
 func (m *marketMaker) snapQty(qty decimal.Decimal) decimal.Decimal {
+	if m.maxQuantity.IsPositive() && qty.GreaterThan(m.maxQuantity) {
+		qty = m.maxQuantity
+	}
 	if m.lot.IsZero() {
 		return qty
 	}

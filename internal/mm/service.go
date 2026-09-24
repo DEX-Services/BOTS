@@ -138,7 +138,14 @@ func (s *Service) Create(ctx context.Context, base string, market models.Market,
 	delete(merged, "investment")
 
 	bot := &models.Bot{
-		UserID:        "admin",
+		// The bot trades under the desk wallet itself, NOT a shared account:
+		// the engine serializes MM ladder-replaces per account (see the
+		// engine's mmAccountLocks), so N desks all trading as one shared user
+		// contend on a single 8s lock and 409 "replace already in flight"
+		// under requote storms. Wallet == UserID makes each desk a distinct
+		// engine account, and deposits into the desk are then the full,
+		// self-contained sizing source for the strategy.
+		UserID:        wallet,
 		WalletAddress: wallet,
 		Name:          fmt.Sprintf("MM %s %s", base, market),
 		Strategy:      strategyKey,
@@ -489,6 +496,18 @@ func (s *Service) Recredit(ctx context.Context) error {
 // after a matching-engine restart wiped its in-memory reservations.
 func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) error {
 	quoteAsset := collateralAsset(desk.Market)
+	// A desk can outlive its users row: the DB may have been restored/cleared
+	// (see Dex-Backend's clear-chain-data, recover-db.sh), or a cleanup pass
+	// removed it, while the market_makers/bots rows survived. Every call below
+	// — release-locks, available, resync — writes or reads that id against
+	// user_balances, whose foreign key requires the users row, so a missing one
+	// made enabling the desk fail with a bare SQLSTATE 23503 on
+	// user_balances_reordered_user_id_fkey and no indication of the cause.
+	// Create and Deposit already provision it; do it here too so a desk can be
+	// enabled without having been re-funded first. Idempotent.
+	if err := s.backend.EnsureUser(ctx, desk.WalletAddress); err != nil {
+		return fmt.Errorf("ensure backend user: %w", err)
+	}
 	if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, quoteAsset); err != nil {
 		return fmt.Errorf("release stale quote locks for %s: %w", desk.ID, err)
 	}

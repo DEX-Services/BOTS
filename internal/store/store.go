@@ -66,6 +66,10 @@ type SymbolSpec struct {
 	Base   string
 	Tick   decimal.Decimal
 	Lot    decimal.Decimal
+	// MaxQuantity is the per-order quantity ceiling the engine's
+	// validateOrderConfig enforces ("quantity exceeds maximum quantity").
+	// Zero means uncapped/unknown.
+	MaxQuantity decimal.Decimal
 }
 
 // LookupSymbol resolves a (symbol, market) pair against symbol_configs — the
@@ -84,16 +88,17 @@ type SymbolSpec struct {
 // lets an admin type any casing and still get a desk wired to the real book.
 func (s *Store) LookupSymbol(ctx context.Context, symbol, market string) (SymbolSpec, error) {
 	var spec SymbolSpec
-	var tick, lot string
+	var tick, lot, maxQty string
 	err := s.pool.QueryRow(ctx, `
-		SELECT symbol, base_currency, tick_size, lot_size FROM symbol_configs
+		SELECT symbol, base_currency, tick_size, lot_size, max_quantity::text FROM symbol_configs
 		WHERE lower(symbol) = lower($1) AND market = $2 AND active = true`,
-		symbol, market).Scan(&spec.Symbol, &spec.Base, &tick, &lot)
+		symbol, market).Scan(&spec.Symbol, &spec.Base, &tick, &lot, &maxQty)
 	if err != nil {
 		return SymbolSpec{}, err
 	}
 	spec.Tick, _ = decimal.NewFromString(tick)
 	spec.Lot, _ = decimal.NewFromString(lot)
+	spec.MaxQuantity, _ = decimal.NewFromString(maxQty)
 	return spec, nil
 }
 

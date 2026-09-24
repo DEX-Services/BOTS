@@ -48,6 +48,13 @@ type Deps struct {
 	// trade" rather than silently submitting an unrounded quantity.
 	Lot  decimal.Decimal
 	Tick decimal.Decimal
+	// MaxQuantity is the engine's per-order quantity ceiling for the symbol
+	// (symbol_configs.max_quantity, "0" = unknown/uncapped). The engine
+	// rejects any order above it wholesale — and a market-maker ladder is
+	// all-or-nothing, so one oversized level killed the desk's ENTIRE
+	// requote forever (observed on DOGE: low unit price + large budget →
+	// per-level qty in the millions vs a 1,000,000 cap).
+	MaxQuantity decimal.Decimal
 }
 
 // Strategy is the interface every bot strategy implements.

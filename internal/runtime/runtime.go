@@ -229,9 +229,9 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 	// "don't round" — acceptable for now since Build() above already
 	// validates the symbol exists via other means for most strategies, but
 	// worth revisiting if a genuinely-unlisted symbol ever reaches here.
-	var lotSize, tickSize decimal.Decimal
+	var lotSize, tickSize, maxQty decimal.Decimal
 	if spec, serr := m.store.LookupSymbol(ctx, bot.Symbol, string(bot.Market)); serr == nil {
-		lotSize, tickSize = spec.Lot, spec.Tick
+		lotSize, tickSize, maxQty = spec.Lot, spec.Tick, spec.MaxQuantity
 	}
 	wakeCh := m.hub.Subscribe(bot.Symbol, string(bot.Market))
 	// Subscribe starts the symbol's poller on its own goroutine, so for the
@@ -256,7 +256,7 @@ func (m *Manager) Start(ctx context.Context, botID string) error {
 		Engine: m.engine, Account: bot.UserID, Bot: bot,
 		MD:    md,
 		Index: m.indexSnapshot(ctx, bot.Symbol, bot.Config),
-		Lot:   lotSize, Tick: tickSize,
+		Lot:   lotSize, Tick: tickSize, MaxQuantity: maxQty,
 	}
 	// Strategies may reconcile external state before they begin ticking. In
 	// particular, a market maker clears stale persisted order IDs here so a
