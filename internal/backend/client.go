@@ -43,14 +43,17 @@ func NewClient(baseURL, secret string) *Client {
 	}
 }
 
-// ResetBalance zeroes the MM desk wallet's free and locked balance for an asset
-// via /internal/balance/reset, reclaiming capital and releasing any locks
-// orphaned by an engine restart. Called on desk deletion.
-func (c *Client) ResetBalance(ctx context.Context, userID, asset string) error {
+// ResetBalance zeroes the MM desk wallet's free and locked balance for an
+// asset in the given market pool via /internal/balance/reset, reclaiming
+// capital and releasing any locks orphaned by an engine restart. market
+// must match the pool the desk actually trades (SPOT for a spot desk,
+// FUTURES/OPTIONS otherwise — see mm.collateralAsset's callers) or this
+// reclaims the wrong pool's row entirely. Called on desk deletion.
+func (c *Client) ResetBalance(ctx context.Context, userID, market, asset string) error {
 	if c.engineSecret == "" {
 		return fmt.Errorf("engine secret not configured; cannot reset backend balance")
 	}
-	body, err := json.Marshal(map[string]string{"userId": userID, "asset": asset})
+	body, err := json.Marshal(map[string]string{"userId": userID, "market": market, "asset": asset})
 	if err != nil {
 		return err
 	}
@@ -72,15 +75,17 @@ func (c *Client) ResetBalance(ctx context.Context, userID, asset string) error {
 	return nil
 }
 
-// ReleaseLocks zeroes ONLY the MM desk wallet's locked balance for an asset via
-// /internal/balance/release-locks, preserving its free capital. Called on bots
-// startup (recredit) to clear holds orphaned by a matching-engine restart, so
-// the desk can lock margin for new quotes again.
-func (c *Client) ReleaseLocks(ctx context.Context, userID, asset string) error {
+// ReleaseLocks zeroes ONLY the MM desk wallet's locked balance for an asset
+// in the given market pool via /internal/balance/release-locks, preserving
+// its free capital — see ResetBalance's doc comment on why market must
+// match the desk's own pool. Called on bots startup (recredit) to clear
+// holds orphaned by a matching-engine restart, so the desk can lock margin
+// for new quotes again.
+func (c *Client) ReleaseLocks(ctx context.Context, userID, market, asset string) error {
 	if c.engineSecret == "" {
 		return fmt.Errorf("engine secret not configured; cannot release backend locks")
 	}
-	body, err := json.Marshal(map[string]string{"userId": userID, "asset": asset})
+	body, err := json.Marshal(map[string]string{"userId": userID, "market": market, "asset": asset})
 	if err != nil {
 		return err
 	}
@@ -109,12 +114,12 @@ func (c *Client) ReleaseLocks(ctx context.Context, userID, asset string) error {
 // quote_amount/base_amount, which only reflects admin deposits/withdrawals
 // and drifts from the real balance as trading P&L moves it (see
 // mm.Service.recreditDesk's comment for the failure this caused).
-func (c *Client) AvailableBalance(ctx context.Context, userID, asset string) (decimal.Decimal, error) {
+func (c *Client) AvailableBalance(ctx context.Context, userID, market, asset string) (decimal.Decimal, error) {
 	if c.engineSecret == "" {
 		return decimal.Zero, fmt.Errorf("engine secret not configured; cannot read backend balance")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		fmt.Sprintf("%s/internal/balance/available?userId=%s&asset=%s", c.baseURL, url.QueryEscape(userID), url.QueryEscape(asset)), nil)
+		fmt.Sprintf("%s/internal/balance/available?userId=%s&market=%s&asset=%s", c.baseURL, url.QueryEscape(userID), url.QueryEscape(market), url.QueryEscape(asset)), nil)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -144,12 +149,12 @@ func (c *Client) AvailableBalance(ctx context.Context, userID, asset string) (de
 // SyncBalance restores an internal desk wallet's durable balance to its
 // authoritative allocation after a matching-engine restart. The amount is a
 // human-unit decimal and is converted to the backend's fixed-point units.
-func (c *Client) SyncBalance(ctx context.Context, userID, asset string, amount decimal.Decimal) error {
+func (c *Client) SyncBalance(ctx context.Context, userID, market, asset string, amount decimal.Decimal) error {
 	if c.engineSecret == "" {
 		return fmt.Errorf("engine secret not configured; cannot synchronize backend balance")
 	}
 	body, err := json.Marshal(map[string]string{
-		"userId": userID, "asset": asset, "amount": toRawUnits(amount),
+		"userId": userID, "market": market, "asset": asset, "amount": toRawUnits(amount),
 	})
 	if err != nil {
 		return err
@@ -201,16 +206,20 @@ func (c *Client) EnsureUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-// CreditBalance adjusts the MM wallet's real Postgres balance via
-// /internal/balance/credit. A positive amount credits; a negative amount
-// debits. The dollar amount is scaled to raw integer units before sending.
-func (c *Client) CreditBalance(ctx context.Context, userID, asset string, amount decimal.Decimal) error {
+// CreditBalance adjusts the MM wallet's real Postgres balance in the given
+// market pool via /internal/balance/credit. A positive amount credits; a
+// negative amount debits. The dollar amount is scaled to raw integer units
+// before sending. market must match the pool the desk actually trades —
+// see ResetBalance's doc comment for the bug this closes (a Futures/Options
+// desk's admin-attested deposit landing in SPOT instead of the pool its
+// orders reserve against, leaving that pool permanently underfunded).
+func (c *Client) CreditBalance(ctx context.Context, userID, market, asset string, amount decimal.Decimal) error {
 	if c.engineSecret == "" {
 		return fmt.Errorf("engine secret not configured; cannot credit backend balance")
 	}
 	raw := toRawUnits(amount)
 	body, err := json.Marshal(map[string]string{
-		"userId": userID, "asset": asset, "amount": raw,
+		"userId": userID, "market": market, "asset": asset, "amount": raw,
 	})
 	if err != nil {
 		return err

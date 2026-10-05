@@ -192,7 +192,7 @@ func (m *marketMaker) Init(ctx context.Context, deps Deps) error {
 	// read as phantom profit and every futures desk reported a fixed 100% ROI
 	// (deposit / deposit) no matter how it actually traded.
 	if m.market == models.Spot {
-		baseBal, err := deps.Engine.Balance(ctx, deps.Account, m.base)
+		baseBal, err := deps.Engine.Balance(ctx, deps.Account, string(m.market), m.base)
 		if err != nil {
 			return fmt.Errorf("read base inventory baseline: %w", err)
 		}
@@ -204,7 +204,7 @@ func (m *marketMaker) Init(ctx context.Context, deps Deps) error {
 		m.state.Equity = nil
 	}
 	if m.market == models.Spot || m.market == models.Futures {
-		quoteBal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset)
+		quoteBal, err := deps.Engine.Balance(ctx, deps.Account, string(m.market), m.quoteAsset)
 		if err != nil {
 			return fmt.Errorf("read quote inventory baseline: %w", err)
 		}
@@ -299,7 +299,7 @@ func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid deci
 	// read and makes the desk self-heal from that drift the same tick it's
 	// hit, instead of going dark until a manual restart re-runs Init.
 	if m.market == models.Spot {
-		if bal, err := deps.Engine.Balance(ctx, deps.Account, m.base); err == nil {
+		if bal, err := deps.Engine.Balance(ctx, deps.Account, string(m.market), m.base); err == nil {
 			held = bal.Balance
 			m.state.BaseHeld = held.String()
 		}
@@ -354,7 +354,7 @@ func (m *marketMaker) requoteWithSpread(ctx context.Context, deps Deps, mid deci
 	// matters is what will be free once that happens — the full balance, not
 	// balance-minus-the-old-lock.
 	budget := m.investment
-	if bal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset); err == nil && bal.Balance.IsPositive() {
+	if bal, err := deps.Engine.Balance(ctx, deps.Account, string(m.market), m.quoteAsset); err == nil && bal.Balance.IsPositive() {
 		budget = bal.Balance
 		// Same drift problem as BaseHeld, on the quote leg: QuoteHeld is
 		// tracked purely from in-memory fill deltas (applyQuoteDelta) and

@@ -66,17 +66,22 @@ func (c *Client) getEngineSecret() string {
 }
 
 // LedgerSync credits or debits an account's in-memory engine ledger balance
-// via /internal/ledger/sync. direction must be "credit" or "debit". Used by
-// the market-maker funding layer to fund/defund MM wallets. Returns an error
-// if the engine secret is unset or the engine rejects the change (e.g. a debit
-// exceeding balance).
-func (c *Client) LedgerSync(ctx context.Context, account, asset, amount, direction string) error {
+// in the given market pool via /internal/ledger/sync. direction must be
+// "credit" or "debit". Used by the market-maker funding layer to fund/defund
+// MM wallets — market must match the pool the desk actually trades (SPOT
+// for a spot desk, FUTURES/OPTIONS otherwise), or this credits the wrong
+// pool while the desk's own orders reserve against a different one,
+// leaving that one permanently underfunded (the exact bug this parameter
+// closes — see matching-engine's /internal/ledger/sync handler doc
+// comment). Returns an error if the engine secret is unset or the engine
+// rejects the change (e.g. a debit exceeding balance).
+func (c *Client) LedgerSync(ctx context.Context, account, market, asset, amount, direction string) error {
 	secret := c.getEngineSecret()
 	if secret == "" {
 		return fmt.Errorf("engine secret not configured; cannot sync ledger")
 	}
 	body, err := json.Marshal(map[string]string{
-		"accountId": account, "asset": asset, "amount": amount, "direction": direction,
+		"accountId": account, "market": market, "asset": asset, "amount": amount, "direction": direction,
 		// requestId (M4) lets the engine recognize a resend of this exact
 		// call as a duplicate rather than re-applying it — see
 		// matching-engine's ledgerSyncDedup. LedgerSync itself doesn't
@@ -364,10 +369,13 @@ func (c *Client) Ticker(ctx context.Context, symbol, market string) (Ticker, err
 	return parseTicker(resp)
 }
 
-// Balance fetches the in-memory ledger balance for an account/asset.
-func (c *Client) Balance(ctx context.Context, account, asset string) (Balance, error) {
+// Balance fetches the in-memory ledger balance for an account/asset in the
+// given market pool. market must match the pool the account actually
+// trades (SPOT for a spot desk, FUTURES/OPTIONS otherwise) — querying the
+// wrong pool silently reads an unrelated balance rather than erroring.
+func (c *Client) Balance(ctx context.Context, account, market, asset string) (Balance, error) {
 	var b Balance
-	if err := c.get(ctx, "/admin/balance?account="+url.QueryEscape(account)+"&asset="+url.QueryEscape(asset), &b); err != nil {
+	if err := c.get(ctx, "/admin/balance?account="+url.QueryEscape(account)+"&market="+url.QueryEscape(market)+"&asset="+url.QueryEscape(asset), &b); err != nil {
 		return Balance{}, err
 	}
 	return b, nil

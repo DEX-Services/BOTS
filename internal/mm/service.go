@@ -204,6 +204,24 @@ func legAsset(desk *models.MarketMaker, leg string) (string, error) {
 	}
 }
 
+// legMarket returns the engine/backend market pool leg's balance actually
+// lives in — NOT always desk.Market. The base leg (a spot desk's holdable
+// asset) always lives in the SPOT pool regardless of the desk's own
+// market, since legAsset already refuses a base leg for a Futures/Options
+// desk (there is no base balance for those at all). The quote leg lives in
+// desk.Market itself — a Futures desk's quote collateral must be funded
+// directly into the engine's FUTURES pool, or its own orders (which
+// reserve against FUTURES) find it empty forever (the bug this function
+// closes — see the matching-engine /internal/ledger/sync handler's doc
+// comment and Dex-Backend's ReleaseLocksForMarket doc comment for the full
+// story).
+func legMarket(desk *models.MarketMaker, leg string) string {
+	if leg == "base" {
+		return string(models.Spot)
+	}
+	return string(desk.Market)
+}
+
 // Deposit records an admin-attested capital add to one leg (leg: "base" or
 // "quote") of a desk. It credits the MM wallet's real Dex-Backend Postgres
 // balance for that specific asset (the authoritative balance the engine risk-
@@ -225,23 +243,24 @@ func (s *Service) Deposit(ctx context.Context, deskID, leg string, amount decima
 	if err != nil {
 		return nil, err
 	}
+	market := legMarket(desk, leg)
 	// Idempotent: covers desks provisioned before the users row existed.
 	if err := s.backend.EnsureUser(ctx, desk.WalletAddress); err != nil {
 		return nil, fmt.Errorf("ensure backend user: %w", err)
 	}
-	if err := s.backend.CreditBalance(ctx, desk.WalletAddress, asset, amount); err != nil {
+	if err := s.backend.CreditBalance(ctx, desk.WalletAddress, market, asset, amount); err != nil {
 		return nil, fmt.Errorf("backend credit: %w", err)
 	}
-	if err := s.engine.LedgerSync(ctx, desk.WalletAddress, asset, amount.String(), "credit"); err != nil {
-		_ = s.backend.CreditBalance(ctx, desk.WalletAddress, asset, amount.Neg())
+	if err := s.engine.LedgerSync(ctx, desk.WalletAddress, market, asset, amount.String(), "credit"); err != nil {
+		_ = s.backend.CreditBalance(ctx, desk.WalletAddress, market, asset, amount.Neg())
 		return nil, fmt.Errorf("engine credit: %w", err)
 	}
 	next, err := s.store.Fund(ctx, deskID, leg, "deposit", amount, decimal.Zero, adminID, note)
 	if err != nil {
 		// Credited both ledgers already; compensate so neither drifts above the
 		// DB source of truth.
-		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, asset, amount.String(), "debit")
-		_ = s.backend.CreditBalance(ctx, desk.WalletAddress, asset, amount.Neg())
+		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, market, asset, amount.String(), "debit")
+		_ = s.backend.CreditBalance(ctx, desk.WalletAddress, market, asset, amount.Neg())
 		return nil, err
 	}
 	if leg == "quote" {
@@ -270,7 +289,8 @@ func (s *Service) Withdraw(ctx context.Context, deskID, leg string, amount decim
 	if err != nil {
 		return nil, err
 	}
-	bal, err := s.engine.Balance(ctx, desk.WalletAddress, asset)
+	market := legMarket(desk, leg)
+	bal, err := s.engine.Balance(ctx, desk.WalletAddress, market, asset)
 	if err != nil {
 		return nil, fmt.Errorf("engine balance: %w", err)
 	}
@@ -287,14 +307,14 @@ func (s *Service) Withdraw(ctx context.Context, deskID, leg string, amount decim
 	if err != nil {
 		return nil, err
 	}
-	if err := s.engine.LedgerSync(ctx, desk.WalletAddress, asset, amount.String(), "debit"); err != nil {
+	if err := s.engine.LedgerSync(ctx, desk.WalletAddress, market, asset, amount.String(), "debit"); err != nil {
 		// DB already lowered; restore it so it doesn't sink below the ledger.
 		_, _ = s.store.Fund(ctx, deskID, leg, "deposit", amount, decimal.Zero, adminID, "revert: engine debit failed")
 		return nil, fmt.Errorf("engine debit: %w", err)
 	}
-	if err := s.backend.CreditBalance(ctx, desk.WalletAddress, asset, amount.Neg()); err != nil {
+	if err := s.backend.CreditBalance(ctx, desk.WalletAddress, market, asset, amount.Neg()); err != nil {
 		// Engine debited and DB lowered; roll both back so all three agree.
-		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, asset, amount.String(), "credit")
+		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, market, asset, amount.String(), "credit")
 		_, _ = s.store.Fund(ctx, deskID, leg, "deposit", amount, decimal.Zero, adminID, "revert: backend debit failed")
 		return nil, fmt.Errorf("backend debit: %w", err)
 	}
@@ -353,17 +373,17 @@ func (s *Service) Delete(ctx context.Context, deskID string) error {
 	// orphaned by an engine restart), so the wallet id can be safely reused by
 	// a future desk without inheriting a ghost balance.
 	if amt, aerr := decimal.NewFromString(desk.QuoteAmount); aerr == nil && amt.IsPositive() {
-		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, collateralAsset(desk.Market), amt.String(), "debit")
+		_ = s.engine.LedgerSync(ctx, desk.WalletAddress, string(desk.Market), collateralAsset(desk.Market), amt.String(), "debit")
 	}
-	_ = s.backend.ResetBalance(ctx, desk.WalletAddress, collateralAsset(desk.Market))
+	_ = s.backend.ResetBalance(ctx, desk.WalletAddress, string(desk.Market), collateralAsset(desk.Market))
 	// Base-leg teardown is SPOT-only, for the same reason Recredit skips it:
 	// a futures desk never held the base asset, and for a non-crypto perp that
 	// ticker isn't a Dex-Backend balance column at all.
 	if desk.Market == models.Spot {
 		if amt, aerr := decimal.NewFromString(desk.BaseAmount); aerr == nil && amt.IsPositive() {
-			_ = s.engine.LedgerSync(ctx, desk.WalletAddress, desk.Base, amt.String(), "debit")
+			_ = s.engine.LedgerSync(ctx, desk.WalletAddress, string(models.Spot), desk.Base, amt.String(), "debit")
 		}
-		_ = s.backend.ResetBalance(ctx, desk.WalletAddress, desk.Base)
+		_ = s.backend.ResetBalance(ctx, desk.WalletAddress, string(models.Spot), desk.Base)
 	}
 	if err := s.store.DeleteMM(ctx, deskID); err != nil {
 		return err
@@ -508,7 +528,7 @@ func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) er
 	if err := s.backend.EnsureUser(ctx, desk.WalletAddress); err != nil {
 		return fmt.Errorf("ensure backend user: %w", err)
 	}
-	if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, quoteAsset); err != nil {
+	if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, string(desk.Market), quoteAsset); err != nil {
 		return fmt.Errorf("release stale quote locks for %s: %w", desk.ID, err)
 	}
 	// Only a SPOT desk holds the base asset; a futures desk margins
@@ -517,7 +537,7 @@ func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) er
 	// "AAPL.us"), which isn't a balance column in Dex-Backend at all — asking
 	// it to release locks there fails "unsupported asset".
 	if desk.Market == models.Spot {
-		if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, desk.Base); err != nil {
+		if err := s.backend.ReleaseLocks(ctx, desk.WalletAddress, string(models.Spot), desk.Base); err != nil {
 			return fmt.Errorf("release stale base locks for %s: %w", desk.ID, err)
 		}
 	}
@@ -558,16 +578,16 @@ func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) er
 	// rather than aborting SetEnabled/Start — the desk still starts, at
 	// worst with the same staleness that existed before this resync was
 	// added, which is the pre-existing (imperfect but working) behavior.
-	if avail, err := s.backend.AvailableBalance(ctx, desk.WalletAddress, quoteAsset); err == nil {
-		if err := s.resyncEngineBalance(ctx, desk.WalletAddress, quoteAsset, avail); err != nil {
+	if avail, err := s.backend.AvailableBalance(ctx, desk.WalletAddress, string(desk.Market), quoteAsset); err == nil {
+		if err := s.resyncEngineBalance(ctx, desk.WalletAddress, string(desk.Market), quoteAsset, avail); err != nil {
 			slog.Warn("resync engine quote balance failed; desk starting with possibly-stale balance", "desk", desk.ID, "error", err)
 		}
 	} else {
 		slog.Warn("read true quote balance failed; desk starting with possibly-stale balance", "desk", desk.ID, "error", err)
 	}
 	if desk.Market == models.Spot {
-		if avail, err := s.backend.AvailableBalance(ctx, desk.WalletAddress, desk.Base); err == nil {
-			if err := s.resyncEngineBalance(ctx, desk.WalletAddress, desk.Base, avail); err != nil {
+		if avail, err := s.backend.AvailableBalance(ctx, desk.WalletAddress, string(models.Spot), desk.Base); err == nil {
+			if err := s.resyncEngineBalance(ctx, desk.WalletAddress, string(models.Spot), desk.Base, avail); err != nil {
 				slog.Warn("resync engine base balance failed; desk starting with possibly-stale balance", "desk", desk.ID, "error", err)
 			}
 		} else {
@@ -589,8 +609,8 @@ func (s *Service) recreditDesk(ctx context.Context, desk *models.MarketMaker) er
 // resyncEngineBalance brings the engine's in-memory balance for wallet/asset
 // up (or down) to target (Postgres's true available balance for that leg,
 // per AvailableBalance) by crediting/debiting exactly the difference.
-func (s *Service) resyncEngineBalance(ctx context.Context, wallet, asset string, target decimal.Decimal) error {
-	current, err := s.engine.Balance(ctx, wallet, asset)
+func (s *Service) resyncEngineBalance(ctx context.Context, wallet, market, asset string, target decimal.Decimal) error {
+	current, err := s.engine.Balance(ctx, wallet, market, asset)
 	if err != nil {
 		return fmt.Errorf("read engine balance: %w", err)
 	}
@@ -599,7 +619,7 @@ func (s *Service) resyncEngineBalance(ctx context.Context, wallet, asset string,
 		return nil
 	}
 	if delta.IsPositive() {
-		return s.engine.LedgerSync(ctx, wallet, asset, delta.String(), "credit")
+		return s.engine.LedgerSync(ctx, wallet, market, asset, delta.String(), "credit")
 	}
-	return s.engine.LedgerSync(ctx, wallet, asset, delta.Neg().String(), "debit")
+	return s.engine.LedgerSync(ctx, wallet, market, asset, delta.Neg().String(), "debit")
 }

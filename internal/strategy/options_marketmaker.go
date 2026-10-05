@@ -199,7 +199,7 @@ func (m *optionsMarketMaker) OnTick(ctx context.Context, deps Deps) error {
 	// self-correcting reason marketMaker does (investment is a funding-time
 	// snapshot that real trading drifts away from and never updates).
 	budget := m.investment
-	if bal, err := deps.Engine.Balance(ctx, deps.Account, m.quoteAsset); err == nil && bal.Balance.IsPositive() {
+	if bal, err := deps.Engine.Balance(ctx, deps.Account, string(models.Options), m.quoteAsset); err == nil && bal.Balance.IsPositive() {
 		budget = bal.Balance
 	}
 	spent := decimal.Zero
