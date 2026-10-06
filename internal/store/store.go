@@ -32,7 +32,11 @@ func New(ctx context.Context, uri string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	cfg.MaxConns = 10
+	// Shared Aiven instance's connection limit dropped from 100 to 25
+	// (2026-10-06) — see Dex-Backend's internal/db/db.go for the full
+	// rebalanced split (backend 10, matching-engine 6, bots 4,
+	// prediction-service 4, 1 spare).
+	cfg.MaxConns = 4
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres pool: %w", err)
